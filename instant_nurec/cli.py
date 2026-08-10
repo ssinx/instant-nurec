@@ -138,6 +138,27 @@ def make_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--render-input-cameras",
+        action="store_true",
+        help=(
+            "Render every source-camera frame after reconstruction. Outputs diagnostic "
+            "z-buffer-splat PNGs plus input/render comparisons under "
+            "<output-dir>/<run-id>/render/."
+        ),
+    )
+    parser.add_argument(
+        "--render-gaussian-chunk-size",
+        type=int,
+        default=100_000,
+        help="Gaussians projected at once per diagnostic render frame (default: 100000).",
+    )
+    parser.add_argument(
+        "--render-splat-radius-px",
+        type=int,
+        default=1,
+        help="Diagnostic render splat radius in pixels, from 0 to 4 (default: 1).",
+    )
+    parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         default="INFO",
@@ -149,6 +170,10 @@ def make_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = make_parser().parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
+    if args.render_gaussian_chunk_size <= 0:
+        raise ValueError("--render-gaussian-chunk-size must be positive.")
+    if not 0 <= args.render_splat_radius_px <= 4:
+        raise ValueError("--render-splat-radius-px must be between 0 and 4.")
 
     # Lazy imports keep argparse-only invocations (e.g. --help) cheap.
     from instant_nurec.config_schema.dataset import (
@@ -163,7 +188,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         KelvinModelConfig,
         KelvinPointQueryCADecoderConfig,
     )
-    from instant_nurec.config_schema.predict import PredictConfig, PrimitiveMergeConfig
+    from instant_nurec.config_schema.predict import (
+        InputCameraRenderConfig,
+        PredictConfig,
+        PrimitiveMergeConfig,
+    )
     from instant_nurec.ncore_input import resolve_ncore_paths
     from instant_nurec.predict.run import run_predict
 
@@ -233,6 +262,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 enabled=args.merge,
                 enable_voxelization=args.merge,
                 target_n_gaussians=args.n_gaussians,
+            ),
+            input_camera_render=InputCameraRenderConfig(
+                enabled=args.render_input_cameras,
+                gaussian_chunk_size=args.render_gaussian_chunk_size,
+                splat_radius_px=args.render_splat_radius_px,
             ),
         ),
     )

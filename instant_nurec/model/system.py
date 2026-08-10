@@ -32,6 +32,7 @@ from instant_nurec.datasets.datamodule import InstantNuRecDataModule
 from instant_nurec.model.inference import KelvinInferenceModel
 from instant_nurec.predict.export_ply import export_ply
 from instant_nurec.predict.primitive_merge import KelvinPrimitiveMerge
+from instant_nurec.predict.render import render_input_camera_frames
 from instant_nurec.primitives.base import BaseInstantNuRecPrimitive
 from instant_nurec.utils.batch import InstantNuRecDataBatch
 from instant_nurec.utils.types import RigTrajectories
@@ -56,6 +57,15 @@ class GaussiansInstantNuRecSystem(nn.Module):
         self.export_preprocess = config.model.export_preprocess
         self.datamodule = InstantNuRecDataModule(config)
         self.model = model
+        predict_dataset = config.dataset.predict
+        self.camera_names_by_index = (
+            {
+                camera_index: camera_id
+                for camera_index, camera_id in enumerate(predict_dataset.context_camera_ids)
+            }
+            if predict_dataset is not None
+            else {}
+        )
 
     @property
     def device(self) -> torch.device:
@@ -87,6 +97,27 @@ class GaussiansInstantNuRecSystem(nn.Module):
                 primitives_chunk_list[i] = primitives_chunk_list[i].preprocess_for_export(
                     batch_chunk.context[i], self.export_preprocess, context_rig=context_rig_i
                 )
+                if self.predict_config.input_camera_render.enabled:
+                    meta = batch_chunk.meta[i] if batch_chunk.meta is not None else {}
+                    sequence_id = meta.get("sequence_id", f"sample_{inner_batch_idx + i:04d}")
+                    camera_names_by_index = self.camera_names_by_index
+                    if context_rig_i is not None:
+                        camera_names_by_index = {
+                            calibration.unique_sensor_idx: camera_id
+                            for camera_id, calibration in context_rig_i.camera_calibrations.items()
+                        }
+                    render_dir = Path(self.out_dir) / self.run_id / "render" / sequence_id / (
+                        f"chunk_{inner_batch_idx + i:03d}"
+                    )
+                    render_paths = render_input_camera_frames(
+                        primitives_chunk_list[i],
+                        batch_chunk.context[i],
+                        output_dir=render_dir,
+                        camera_names_by_index=camera_names_by_index,
+                        gaussian_chunk_size=self.predict_config.input_camera_render.gaussian_chunk_size,
+                        splat_radius_px=self.predict_config.input_camera_render.splat_radius_px,
+                    )
+                    logger.info("Wrote %d source-view diagnostic render(s) under %s", len(render_paths), render_dir)
             primitives_list.extend(primitives_chunk_list)
             inner_batch_idx += _CHUNK_SIZE
             progress_bar.update(_CHUNK_SIZE)
