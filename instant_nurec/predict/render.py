@@ -119,6 +119,7 @@ def render_static_gaussians(
         render_mode="RGB",
         camera_model="pinhole",
         with_ut=with_ut,
+        packed=not with_ut,
         **distortion_kwargs,
     )
     return rendered[0, ..., :3].clamp_(0.0, 1.0)
