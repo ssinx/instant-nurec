@@ -114,8 +114,6 @@ class GaussiansInstantNuRecSystem(nn.Module):
                         batch_chunk.context[i],
                         output_dir=render_dir,
                         camera_names_by_index=camera_names_by_index,
-                        gaussian_chunk_size=self.predict_config.input_camera_render.gaussian_chunk_size,
-                        splat_radius_px=self.predict_config.input_camera_render.splat_radius_px,
                     )
                     logger.info("Wrote %d source-view diagnostic render(s) under %s", len(render_paths), render_dir)
             primitives_list.extend(primitives_chunk_list)

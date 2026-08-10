@@ -252,10 +252,17 @@ instant-nurec \
     --render-input-cameras
 ```
 
-This first renderer is a pure-Torch opaque z-buffer splat of static Gaussian
-centers. It preserves the input camera calibration and is intended for
-debugging projections and coverage; it does not yet render dynamic layers,
-the sky cubemap, or NuRec-quality alpha-composited Gaussian footprints.
+The renderer uses `gsplat` to project each Gaussian's learned anisotropic
+covariance to a screen-space ellipse and alpha-composite it in depth order.
+Install the renderer in the active environment before adding the flag:
+
+```bash
+proxy pip install gsplat==1.5.3
+```
+
+The current integration supports Waymo's OpenCV pinhole calibration, including
+radial, tangential, and thin-prism distortion. It renders the static layer;
+dynamic layers and the sky cubemap are the next development steps.
 
 #### CLI reference
 
@@ -268,9 +275,7 @@ the sky cubemap, or NuRec-quality alpha-composited Gaussian footprints.
 | `--n-gaussians` | `2000000` | Target number of static Gaussians after voxelization. Only consulted when `--merge` is set. The voxel size is searched iteratively via bracketed binary search to land the count in `[0.9 * target, target]`. |
 | `--camera-id` | profile-dependent | Override a context camera. Repeat once per camera in canonical order. `pa-front` requires 1; `pa-multiview` supports 1, 3, or 5; `pq-front` is fixed to `camera_front_wide_120fov`. |
 | `--max-chunks` | `8` | Maximum number of time-chunks processed per clip. One chunk spans up to 13.5 s, so the default covers 108 s. Longer clips are truncated and a `WARNING` logs the required value. |
-| `--render-input-cameras` | absent (false) | Render every source camera frame as a diagnostic static-scene PNG and write an input/render comparison. Output is under `out_dir/<run_id>/render/`. |
-| `--render-gaussian-chunk-size` | `100000` | Number of Gaussians projected at once for each diagnostic image. Lower it if rendering runs out of GPU memory. |
-| `--render-splat-radius-px` | `1` | Radius of each diagnostic z-buffer splat in pixels, from 0 to 4. |
+| `--render-input-cameras` | absent (false) | Render every source camera frame with the `gsplat` CUDA 3DGS rasterizer and write an input/render comparison. Output is under `out_dir/<run_id>/render/`. |
 | `--log-level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`. |
 
 #### Environment variables

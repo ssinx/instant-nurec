@@ -10,6 +10,7 @@ dependencies = [
     # attributable to a deliberate dep bump rather than to whichever
     # wheel happens to be the latest at install time.
     "einops==0.8.1",
+    "gsplat==1.5.3",
     "huggingface_hub==0.36.2",
     "numcodecs==0.11.0",
     "numpy==1.26.4",

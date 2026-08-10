@@ -56,24 +56,11 @@ class PrimitiveMergeConfig(BaseConfigSchema):
 class InputCameraRenderConfig(BaseConfigSchema):
     """Options for diagnostic renders from the input camera viewpoints.
 
-    The standalone renderer uses a pure-Torch z-buffer splat path so it does
-    not require a separate CUDA rasterizer dependency. It is intended for
-    checking reconstruction/camera alignment; NuRec remains the path for
-    production-quality 3DGS rendering.
+    Rendering uses the optional ``gsplat`` CUDA rasterizer. It projects the
+    learned anisotropic Gaussian covariance and alpha-composites the result.
     """
 
     enabled: bool = Field(default=False, description="Whether to render every input camera frame during prediction")
-    gaussian_chunk_size: int = Field(
-        default=100_000,
-        description="Maximum number of Gaussians projected at once per rendered frame",
-        gt=0,
-    )
-    splat_radius_px: int = Field(
-        default=1,
-        description="Screen-space radius of the diagnostic z-buffer splat in pixels",
-        ge=0,
-        le=4,
-    )
 
 
 class PredictConfig(BaseConfigSchema):
