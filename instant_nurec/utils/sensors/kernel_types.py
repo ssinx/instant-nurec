@@ -13,13 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dataclasses + enums consumed by the in-tree torch ray-gen
-(``ray_gen.py``).
-
-FTheta-only by design. OpenCVPinhole and OpenCVFisheye distortion
-models are intentionally not supported on the input side; the other
-distortion families are explicitly dropped.
-"""
+"""Dataclasses + enums consumed by the in-tree torch ray-gen (`ray_gen.py`)."""
 
 from __future__ import annotations
 
@@ -265,6 +259,17 @@ class FThetaProjection(CameraProjection):
 
 
 @dataclass
+class PinholeProjection(CameraProjection):
+    """OpenCV pinhole projection with rational radial distortion."""
+
+    principal_point: torch.Tensor
+    focal_length: torch.Tensor
+    radial_coeffs: torch.Tensor
+    tangential_coeffs: torch.Tensor
+    thin_prism_coeffs: torch.Tensor
+
+
+@dataclass
 class Pose:
     """Static SE(3) pose."""
 
@@ -288,6 +293,7 @@ __all__ = [
     "FThetaPolynomialType",
     "FThetaProjection",
     "NoExternalDistortion",
+    "PinholeProjection",
     "Pose",
     "ReferencePolynomial",
     "ShutterType",

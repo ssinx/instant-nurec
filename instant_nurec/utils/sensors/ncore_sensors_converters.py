@@ -28,6 +28,7 @@ from instant_nurec.utils.sensors.kernel_types import (
     FThetaPolynomialType,
     FThetaProjection,
     NoExternalDistortion,
+    PinholeProjection,
     Pose,
     ShutterType,
 )
@@ -83,12 +84,11 @@ class CameraModelConverter:
         if device is None:
             device = torch.device("cpu")
 
-        # Convert projection based on type. FTheta is the only supported
-        # input projection — Pinhole/Fisheye were intentionally dropped
-        # because Kelvin predict was never exercised with them.
         projection: CameraProjection
         if isinstance(camera_model, FThetaCameraModel):
             projection = CameraModelConverter._convert_ftheta(camera_model, device)
+        elif type(camera_model).__name__ == "OpenCVPinholeCameraModel":
+            projection = CameraModelConverter._convert_opencv_pinhole(camera_model, device)
         else:
             raise TypeError(f"Unsupported camera model type: {type(camera_model).__name__}")
 
@@ -123,6 +123,19 @@ class CameraModelConverter:
             max_angle=camera_model.max_angle,
             newton_iterations=camera_model.newton_iterations,
             min_2d_norm=1e-6,
+        )
+
+    @staticmethod
+    def _convert_opencv_pinhole(
+        camera_model: CameraModel,
+        device: torch.device,
+    ) -> PinholeProjection:
+        return PinholeProjection(
+            principal_point=torch.as_tensor(camera_model.principal_point, device=device),
+            focal_length=torch.as_tensor(camera_model.focal_length, device=device),
+            radial_coeffs=torch.as_tensor(camera_model.radial_coeffs, device=device),
+            tangential_coeffs=torch.as_tensor(camera_model.tangential_coeffs, device=device),
+            thin_prism_coeffs=torch.as_tensor(camera_model.thin_prism_coeffs, device=device),
         )
 
     @staticmethod

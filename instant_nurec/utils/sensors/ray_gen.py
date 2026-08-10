@@ -20,8 +20,9 @@
 * ``camera_rays_to_image_points`` — forward camera projection (consumed
   by ``instant_nurec/utils/cubemap.py``).
 
-FTheta is the supported projection model. External distortion supports
-``NoExternalDistortion`` and NRE-compatible bivariate windshield models.
+FTheta and OpenCV pinhole projection models are supported. External
+distortion supports ``NoExternalDistortion`` and NRE-compatible bivariate
+windshield models.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from instant_nurec.utils.sensors.kernel_types import (
     FThetaPolynomialType,
     FThetaProjection,
     NoExternalDistortion,
+    PinholeProjection,
     ShutterType,
 )
 
@@ -112,6 +114,98 @@ def _ftheta_image_points_to_camera_rays(
         [[0, 0, 1]], device=image_points.device, dtype=image_points.dtype
     )
     return cam_rays
+
+
+def _pinhole_distort_normalized_points(
+    normalized_points: torch.Tensor,
+    projection: PinholeProjection,
+) -> torch.Tensor:
+    x = normalized_points[:, 0]
+    y = normalized_points[:, 1]
+    r2 = x * x + y * y
+    r4 = r2 * r2
+    r6 = r4 * r2
+
+    k1, k2, k3, k4, k5, k6 = projection.radial_coeffs.to(
+        device=x.device,
+        dtype=x.dtype,
+    ).unbind()
+    numerator = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+    denominator = 1.0 + k4 * r2 + k5 * r4 + k6 * r6
+    radial = numerator / denominator.clamp_min(torch.finfo(x.dtype).eps)
+
+    p1, p2 = projection.tangential_coeffs.to(
+        device=x.device,
+        dtype=x.dtype,
+    ).unbind()
+    x_tangential = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+    y_tangential = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+
+    s1, s2, s3, s4 = projection.thin_prism_coeffs.to(
+        device=x.device,
+        dtype=x.dtype,
+    ).unbind()
+    x_thin_prism = s1 * r2 + s2 * r4
+    y_thin_prism = s3 * r2 + s4 * r4
+    return torch.stack(
+        [
+            x * radial + x_tangential + x_thin_prism,
+            y * radial + y_tangential + y_thin_prism,
+        ],
+        dim=-1,
+    )
+
+
+def _pinhole_image_points_to_camera_rays(
+    image_points: torch.Tensor,
+    projection: PinholeProjection,
+) -> torch.Tensor:
+    focal_length = projection.focal_length.to(
+        device=image_points.device,
+        dtype=image_points.dtype,
+    )
+    principal_point = projection.principal_point.to(
+        device=image_points.device,
+        dtype=image_points.dtype,
+    )
+    distorted_points = (image_points - principal_point) / focal_length
+    undistorted_points = distorted_points.clone()
+    for _ in range(8):
+        undistorted_points += distorted_points - _pinhole_distort_normalized_points(
+            undistorted_points,
+            projection,
+        )
+    return torch.nn.functional.normalize(
+        torch.cat([undistorted_points, torch.ones_like(undistorted_points[:, :1])], dim=-1),
+        dim=-1,
+    )
+
+
+def _pinhole_camera_rays_to_image_points(
+    camera_rays: torch.Tensor,
+    projection: PinholeProjection,
+    resolution: tuple[int, int] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    z = camera_rays[:, 2]
+    normalized_points = camera_rays[:, :2] / z[:, None].clamp_min(
+        torch.finfo(camera_rays.dtype).eps
+    )
+    distorted_points = _pinhole_distort_normalized_points(normalized_points, projection)
+    focal_length = projection.focal_length.to(
+        device=camera_rays.device,
+        dtype=camera_rays.dtype,
+    )
+    principal_point = projection.principal_point.to(
+        device=camera_rays.device,
+        dtype=camera_rays.dtype,
+    )
+    image_points = distorted_points * focal_length + principal_point
+    valid = z > 0.0
+    if resolution is not None:
+        width, height = resolution
+        valid &= (image_points[:, 0] >= 0.0) & (image_points[:, 0] < width)
+        valid &= (image_points[:, 1] >= 0.0) & (image_points[:, 1] < height)
+    return image_points, valid
 
 
 def _generate_all_pixel_image_points(
@@ -239,6 +333,43 @@ def _ncore_ftheta_to_projection_and_resolution(
     return projection, resolution
 
 
+@torch._dynamo.disable
+def _ncore_pinhole_to_projection_and_resolution(
+    ncore_params: object,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[PinholeProjection, tuple[int, int]]:
+    projection = PinholeProjection(
+        principal_point=torch.tensor(
+            [float(value) + 0.5 for value in ncore_params.principal_point],
+            device=device,
+            dtype=dtype,
+        ),
+        focal_length=torch.tensor(
+            [float(value) for value in ncore_params.focal_length],
+            device=device,
+            dtype=dtype,
+        ),
+        radial_coeffs=torch.tensor(
+            [float(value) for value in ncore_params.radial_coeffs],
+            device=device,
+            dtype=dtype,
+        ),
+        tangential_coeffs=torch.tensor(
+            [float(value) for value in ncore_params.tangential_coeffs],
+            device=device,
+            dtype=dtype,
+        ),
+        thin_prism_coeffs=torch.tensor(
+            [float(value) for value in ncore_params.thin_prism_coeffs],
+            device=device,
+            dtype=dtype,
+        ),
+    )
+    resolution = tuple(int(value) for value in ncore_params.resolution)
+    return projection, resolution
+
+
 @torch._dynamo.disable  # numpy / dataclass conversion from ncore params is outside the compiled path
 def _ncore_external_distortion_to_distortion(
     ncore_params: object, device: torch.device, dtype: torch.dtype
@@ -285,14 +416,7 @@ def camera_rays_to_image_points(
     camera_model_parameters: object,
     cam_rays: torch.Tensor,
 ) -> object:
-    """Forward FTheta camera projection: camera-frame rays → image points + valid mask.
-
-    Accepts an ncore ``FThetaCameraModelParameters`` (matching the libs API)
-    and returns an object with ``.image_points`` and ``.valid_flag``
-    attributes (matching ``ncore.sensors.CameraModel.ImagePointsReturn``).
-
-    Mirrors ``ncore.impl.sensors.camera.FThetaCameraModel._camera_rays_to_image_points_impl``.
-    """
+    """Forward camera projection: camera-frame rays → image points + valid mask."""
     cam_rays = cam_rays.to(dtype=torch.float32).contiguous()
     device = cam_rays.device
     dtype = cam_rays.dtype
@@ -301,6 +425,15 @@ def camera_rays_to_image_points(
         projection = camera_model_parameters
         resolution = None  # caller didn't pass resolution; skip image-bounds check
         external_distortion: ExternalDistortion = NoExternalDistortion()
+    elif isinstance(camera_model_parameters, PinholeProjection):
+        projection = camera_model_parameters
+        resolution = None
+        external_distortion = NoExternalDistortion()
+    elif type(camera_model_parameters).__name__ == "OpenCVPinholeCameraModelParameters":
+        projection, resolution = _ncore_pinhole_to_projection_and_resolution(
+            camera_model_parameters, device, dtype
+        )
+        external_distortion = NoExternalDistortion()
     else:
         projection, resolution = _ncore_ftheta_to_projection_and_resolution(
             camera_model_parameters, device, dtype
@@ -315,6 +448,17 @@ def camera_rays_to_image_points(
         raise NotImplementedError(
             f"unsupported external distortion: {type(external_distortion).__name__}"
         )
+
+    if isinstance(projection, PinholeProjection):
+        image_points, valid = _pinhole_camera_rays_to_image_points(cam_rays, projection, resolution)
+
+        class _ImagePointsReturn:
+            pass
+
+        out = _ImagePointsReturn()
+        out.image_points = image_points
+        out.valid_flag = valid
+        return out
 
     ray_xy_norms = _numerically_stable_xy_norm(cam_rays)
     eps = torch.finfo(torch.float32).eps
@@ -385,12 +529,11 @@ def image_points_to_world_rays_shutter_pose(
     ``image_points_to_world_rays_shutter_pose``.
 
     Returns ``(world_rays (N, 6), timestamps_us (N,) or None, poses_t or
-    None, poses_q or None)``. Camera ray gen is FTheta-only; ``return_poses``
-    is not implemented.
+    None, poses_q or None)``. ``return_poses`` is not implemented.
     """
-    if not isinstance(projection, FThetaProjection):
+    if not isinstance(projection, (FThetaProjection, PinholeProjection)):
         raise NotImplementedError(
-            f"only FThetaProjection supported, got {type(projection).__name__}"
+            f"unsupported camera projection: {type(projection).__name__}"
         )
     if not isinstance(external_distortion, (NoExternalDistortion, BivariateWindshieldDistortion)):
         raise NotImplementedError(
@@ -416,8 +559,10 @@ def image_points_to_world_rays_shutter_pose(
             None,
         )
 
-    # Camera-frame rays via FTheta inverse projection.
-    cam_rays = _ftheta_image_points_to_camera_rays(image_points, projection)
+    if isinstance(projection, PinholeProjection):
+        cam_rays = _pinhole_image_points_to_camera_rays(image_points, projection)
+    else:
+        cam_rays = _ftheta_image_points_to_camera_rays(image_points, projection)
     if isinstance(external_distortion, BivariateWindshieldDistortion):
         cam_rays = external_distortion.undistort_camera_rays(cam_rays)
 
