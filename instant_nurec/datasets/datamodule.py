@@ -15,8 +15,10 @@
 
 from torch.utils.data import DataLoader
 
+from instant_nurec.config_schema.dataset import WaymoParquetInstantNuRecDatasetConfig
 from instant_nurec.config_schema.instantnurec import InstantNuRecConfig
 from instant_nurec.datasets.instantnurec_ncore import NCoreInstantNuRecDataset
+from instant_nurec.datasets.instantnurec_waymo import WaymoParquetInstantNuRecDataset
 from instant_nurec.utils.batch import InstantNuRecDataBatch
 
 
@@ -25,21 +27,26 @@ class InstantNuRecDataModule:
 
     def __init__(self, instantnurec_config: InstantNuRecConfig) -> None:
         self.instantnurec_config = instantnurec_config
-        self.predict_dataset: NCoreInstantNuRecDataset | None = None
+        self.predict_dataset: NCoreInstantNuRecDataset | WaymoParquetInstantNuRecDataset | None = None
 
     def predict_dataloader(self) -> DataLoader:
         dataset_config = self.instantnurec_config.dataset.predict
         assert dataset_config is not None, "dataset.predict has to be specified in the config to use the predict mode"
 
-        self.predict_dataset = NCoreInstantNuRecDataset(
-            dataset_config,
+        dataset_kwargs = dict(
             frame_width=dataset_config.camera_subsampler.frame_width,
             frame_height=dataset_config.camera_subsampler.frame_height,
             n_frames_per_sample=dataset_config.frame_batch_sampler.n_frames_per_sample,
         )
+        is_waymo_dataset = isinstance(dataset_config, WaymoParquetInstantNuRecDatasetConfig)
+        self.predict_dataset = (
+            WaymoParquetInstantNuRecDataset(dataset_config, **dataset_kwargs)
+            if is_waymo_dataset
+            else NCoreInstantNuRecDataset(dataset_config, **dataset_kwargs)
+        )
         return DataLoader(
             self.predict_dataset,
-            num_workers=self.instantnurec_config.system.predict_num_workers,
+            num_workers=0 if is_waymo_dataset else self.instantnurec_config.system.predict_num_workers,
             persistent_workers=False,
             batch_size=self.instantnurec_config.system.predict_batch_size,
             pin_memory=True,

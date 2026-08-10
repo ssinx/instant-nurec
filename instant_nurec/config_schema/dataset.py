@@ -134,9 +134,40 @@ class NCoreInstantNuRecDatasetConfig(BaseConfigSchema):
 
 
 
+class WaymoParquetInstantNuRecDatasetConfig(BaseConfigSchema):
+    """Predict-side config for Waymo Open Dataset v2 component Parquet files."""
+
+    waymo_root: str = Field(
+        description=(
+            "Waymo Open Dataset v2 root containing split/component directories, "
+            "for example /datasets/waymo-open-dataset-v2.0.1."
+        ),
+    )
+    split: Literal["training", "validation", "testing", "testing_location"] = Field(default="validation")
+    segment_ids: list[str] = Field(description="Waymo segment context names to process.", min_length=1)
+    camera_subsampler: CameraSubsamplerConfig = Field(
+        default_factory=CameraSubsamplerConfig,
+        description="Image resize and crop applied before model inference.",
+    )
+    context_camera_ids: list[str] = Field(
+        default_factory=lambda: ["FRONT", "FRONT_LEFT", "FRONT_RIGHT"],
+        description="Waymo camera names in canonical model order.",
+    )
+    supervision_camera_ids: list[str] = Field(
+        default_factory=lambda: ["FRONT", "FRONT_LEFT", "FRONT_RIGHT"],
+        description="Waymo camera names in canonical model order.",
+    )
+    frame_batch_sampler: AdaptiveSequentialFrameBatchSamplerConfig = Field(
+        default_factory=AdaptiveSequentialFrameBatchSamplerConfig,
+    )
+
+
 class InstantNuRecSplitsConfig(BaseConfigSchema):
     """Splits configuration. Predict-only keeps just the predict
     split; pydantic ``extras="ignore"`` drops the train/val/test entries
     that the pretrained ``parsed.yaml`` still carries."""
 
-    predict: NCoreInstantNuRecDatasetConfig | None = Field(default=None, description="Dataset to use in prediction mode")
+    predict: NCoreInstantNuRecDatasetConfig | WaymoParquetInstantNuRecDatasetConfig | None = Field(
+        default=None,
+        description="Dataset to use in prediction mode",
+    )

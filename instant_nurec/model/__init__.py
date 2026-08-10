@@ -79,8 +79,10 @@ def _preflight_validate_camera_ids(config: "InstantNuRecConfig") -> None:
     """Open the first ncorev4 sequence, enumerate its cameras,
     and run ``_validate_camera_ids``. Cheap relative to a full inference
     run; runs once in the main process before workers spin up."""
+    from instant_nurec.config_schema.dataset import NCoreInstantNuRecDatasetConfig
+
     dataset_cfg = config.dataset.predict
-    if dataset_cfg is None or not dataset_cfg.ncore_json_paths:
+    if not isinstance(dataset_cfg, NCoreInstantNuRecDatasetConfig) or not dataset_cfg.ncore_json_paths:
         return
 
     from upath import UPath

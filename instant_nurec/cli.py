@@ -13,12 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Standalone argparse CLI.
-
-``--ncore-path`` accepts either a single ``.json`` ncorev4 sequence
-metadata file (NuRec-aligned) or a ``.lst`` manifest listing one JSON
-path per line (each absolute or relative-to-the-LST-file's directory).
-"""
+"""Standalone argparse CLI for NCore v4 and Waymo Open Dataset v2 inputs."""
 
 from __future__ import annotations
 
@@ -55,16 +50,36 @@ def make_parser() -> argparse.ArgumentParser:
             f"Default: {DEFAULT_MODEL_VARIANT}."
         ),
     )
-    parser.add_argument(
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
         "--ncore-path",
         type=Path,
-        required=True,
         help=(
             "ncorev4 input. Either a single sequence ``.json`` (NuRec-aligned) "
             "or a ``.lst`` manifest with one JSON path per line "
             "(absolute or relative-to-the-LST-file's directory; "
             "``#``-prefixed and blank lines skipped)."
         ),
+    )
+    input_group.add_argument(
+        "--waymo-root",
+        type=Path,
+        help="Waymo Open Dataset v2 root containing split/component Parquet directories.",
+    )
+    parser.add_argument(
+        "--waymo-split",
+        choices=["training", "validation", "testing", "testing_location"],
+        default="validation",
+        help="Waymo v2 split used with --waymo-root. Default: validation.",
+    )
+    parser.add_argument(
+        "--waymo-segment-id",
+        dest="waymo_segment_ids",
+        metavar="SEGMENT_ID",
+        type=str,
+        action="append",
+        default=None,
+        help="Waymo segment context name. Repeat to process multiple segments.",
     )
     parser.add_argument(
         "--output-dir",
@@ -103,7 +118,7 @@ def make_parser() -> argparse.ArgumentParser:
         action="append",
         default=None,
         help=(
-            "Override a profile's ncorev4 context camera. Repeat the flag to "
+            "Override a profile's context camera. Repeat the flag to "
             "provide multiple cameras in canonical order. The selected profile "
             "validates its camera contract. pq-front is fixed to "
             "camera_front_wide_120fov. If omitted, the profile's default camera "
@@ -138,8 +153,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Lazy imports keep argparse-only invocations (e.g. --help) cheap.
     from instant_nurec.config_schema.dataset import (
         AdaptiveSequentialFrameBatchSamplerConfig,
-        NCoreInstantNuRecDatasetConfig,
         InstantNuRecSplitsConfig,
+        NCoreInstantNuRecDatasetConfig,
+        WaymoParquetInstantNuRecDatasetConfig,
     )
     from instant_nurec.config_schema.instantnurec import InstantNuRecConfig
     from instant_nurec.config_schema.models import (
@@ -151,9 +167,44 @@ def main(argv: Sequence[str] | None = None) -> int:
     from instant_nurec.ncore_input import resolve_ncore_paths
     from instant_nurec.predict.run import run_predict
 
-    json_paths = resolve_ncore_paths(args.ncore_path)
     profile = get_model_profile(args.model)
-    camera_ids = list(args.camera_ids or profile.context_camera_ids)
+    if args.waymo_root is not None:
+        if profile.decoder_kind == "point-query":
+            raise ValueError("pq-front is only released for the NCore front-camera contract; use pa-multiview for Waymo.")
+        if not args.waymo_segment_ids:
+            raise ValueError("--waymo-segment-id is required when --waymo-root is used.")
+        camera_ids = list(args.camera_ids or ["FRONT", "FRONT_LEFT", "FRONT_RIGHT"])
+        dataset_config = WaymoParquetInstantNuRecDatasetConfig(
+            waymo_root=str(args.waymo_root),
+            split=args.waymo_split,
+            segment_ids=args.waymo_segment_ids,
+            camera_subsampler={
+                "frame_width": profile.frame_width,
+                "frame_height": profile.frame_height,
+            },
+            context_camera_ids=camera_ids,
+            supervision_camera_ids=camera_ids,
+            frame_batch_sampler=AdaptiveSequentialFrameBatchSamplerConfig(
+                n_frames_per_sample=profile.n_frames_per_sample,
+                n_samples_per_sequence=args.max_chunks,
+            ),
+        )
+    else:
+        json_paths = resolve_ncore_paths(args.ncore_path)
+        camera_ids = list(args.camera_ids or profile.context_camera_ids)
+        dataset_config = NCoreInstantNuRecDatasetConfig(
+            ncore_json_paths=[str(p) for p in json_paths],
+            camera_subsampler={
+                "frame_width": profile.frame_width,
+                "frame_height": profile.frame_height,
+            },
+            context_camera_ids=camera_ids,
+            supervision_camera_ids=camera_ids,
+            frame_batch_sampler=AdaptiveSequentialFrameBatchSamplerConfig(
+                n_frames_per_sample=profile.n_frames_per_sample,
+                n_samples_per_sequence=args.max_chunks,
+            ),
+        )
     allowed_camera_counts = profile.supported_camera_counts
     if len(camera_ids) not in allowed_camera_counts:
         counts = ", ".join(str(count) for count in allowed_camera_counts)
@@ -175,19 +226,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             decoder=decoder_config,
         ),
         dataset=InstantNuRecSplitsConfig(
-            predict=NCoreInstantNuRecDatasetConfig(
-                ncore_json_paths=[str(p) for p in json_paths],
-                camera_subsampler={
-                    "frame_width": profile.frame_width,
-                    "frame_height": profile.frame_height,
-                },
-                context_camera_ids=camera_ids,
-                supervision_camera_ids=camera_ids,
-                frame_batch_sampler=AdaptiveSequentialFrameBatchSamplerConfig(
-                    n_frames_per_sample=profile.n_frames_per_sample,
-                    n_samples_per_sequence=args.max_chunks,
-                ),
-            ),
+            predict=dataset_config,
         ),
         predict=PredictConfig(
             primitive_merge=PrimitiveMergeConfig(
