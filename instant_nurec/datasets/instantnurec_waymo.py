@@ -41,6 +41,16 @@ WAYMO_CAMERA_NAME_TO_ID = {
     "SIDE_RIGHT": 5,
 }
 
+WAYMO_CAMERA_TO_NCORE_CAMERA = np.array(
+    [
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
 
 def _require_pyarrow():
     try:
@@ -166,7 +176,11 @@ class WaymoParquetInstantNuRecDataset(Dataset[InstantNuRecDataBatch]):
         for row in calibration_rows:
             camera_id = int(row["key.camera_name"])
             camera_parameters[camera_id] = self.camera_subsampler.apply_camera_parameters(self._camera_parameters(row))
-            T_camera_vehicle[camera_id] = np.asarray(_field(row, "extrinsic.transform"), dtype=np.float64).reshape(4, 4)
+            T_waymo_camera_vehicle = np.asarray(
+                _field(row, "extrinsic.transform"),
+                dtype=np.float64,
+            ).reshape(4, 4)
+            T_camera_vehicle[camera_id] = T_waymo_camera_vehicle @ WAYMO_CAMERA_TO_NCORE_CAMERA.T
 
         T_vehicle_worlds = {
             int(row["key.frame_timestamp_micros"]): np.asarray(
