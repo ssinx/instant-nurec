@@ -104,6 +104,7 @@ def render_static_gaussians(
     viewmat = torch.linalg.inv(T_sensor_scene.to(device=device, dtype=torch.float32)).unsqueeze(0).contiguous()
     intrinsics = _pinhole_intrinsics(camera_model_parameters, device).unsqueeze(0).contiguous()
     distortion_kwargs = _distortion_kwargs(camera_model_parameters, rasterization, device)
+    with_ut = bool(distortion_kwargs)
 
     rendered, _, _ = rasterization(
         means=static_layer.positions.float().contiguous(),
@@ -117,6 +118,7 @@ def render_static_gaussians(
         height=height,
         render_mode="RGB",
         camera_model="pinhole",
+        with_ut=with_ut,
         **distortion_kwargs,
     )
     return rendered[0, ..., :3].clamp_(0.0, 1.0)
