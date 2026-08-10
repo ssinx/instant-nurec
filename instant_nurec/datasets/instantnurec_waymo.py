@@ -108,7 +108,10 @@ class WaymoParquetInstantNuRecDataset(Dataset[InstantNuRecDataBatch]):
         component_dir = self.root / self.config.split / component
         if not component_dir.is_dir():
             raise InstantNuRecDataError(f"Waymo component directory does not exist: {component_dir}")
-        paths = sorted(component_dir.glob(f"*_{component}_{segment_id}*.parquet"))
+        filename_pattern = f"*{segment_id}*.parquet"
+        paths = sorted(component_dir.glob(filename_pattern))
+        if not paths:
+            paths = sorted(component_dir.rglob(filename_pattern))
         if not paths:
             raise InstantNuRecDataError(
                 f"No {component} Parquet files for segment {segment_id!r} under {component_dir}"
@@ -130,7 +133,7 @@ class WaymoParquetInstantNuRecDataset(Dataset[InstantNuRecDataBatch]):
         )
         tangential_coeffs = np.array([_field(row, "intrinsic.p1"), _field(row, "intrinsic.p2")], dtype=np.float32)
         return OpenCVPinholeCameraModelParameters(
-            resolution=np.array([_field(row, ".width"), _field(row, ".height")], dtype=np.int32),
+            resolution=np.array([_field(row, ".width"), _field(row, ".height")], dtype=np.uint64),
             shutter_type=ShutterType.GLOBAL,
             external_distortion_parameters=None,
             principal_point=principal_point,
