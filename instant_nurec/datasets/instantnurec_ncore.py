@@ -276,6 +276,13 @@ class NCoreInstantNuRecDataset(torch.utils.data.Dataset[InstantNuRecDataBatch]):
             cuboids_dims=all_cuboid_dims,
             device=torch.device("cpu"),
         )
+        dynamic_track_count = sum(bool(flags & TrackFlags.DYNAMIC) for flags in all_tracks_flags)
+        logger.info(
+            "Loaded %d cuboid track(s), including %d dynamic, from label source %s.",
+            len(all_track_ids),
+            dynamic_track_count,
+            self.cuboid_tracks_params.track_label_source,
+        )
         return CuboidTracksDataPack(
             tracks_data=cuboid_tracks.tracks_data,
             cuboidtracks_data=cuboid_tracks.cuboidtracks_data,

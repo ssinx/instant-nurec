@@ -260,7 +260,12 @@ bazel run //tools/data_converter/waymo:convert -- \
 ```
 
 Then reconstruct a converted sequence. `--waymo-ncore` selects NCore's
-official Waymo sensor IDs in model order: front, front-left, front-right.
+official Waymo sensor IDs. For `pa-multiview`, the default is all five cameras:
+front, front-left, front-right, side-left, side-right. This is important because
+the release checkpoint's three-camera default uses 120-degree cameras, whereas
+the converted Waymo camera IDs use the `_50fov` naming convention. The actual
+projection always uses the TFRecord calibration converted to NCore intrinsics;
+the sensor ID does not override or rescale a camera's physical field of view.
 
 ```bash
 instant-nurec \
@@ -294,8 +299,13 @@ the official converter names output from Waymo's internal segment context ID.
 Add `--force-waymo-conversion` to recreate it after changing the source
 TFRecord or converter version.
 
-The official converter can also export all five cameras. To use five input
-views, repeat `--camera-id` in this exact order:
+The official Waymo converter stores cuboid tracks with NCore label source
+`EXTERNAL`; the Waymo input path selects that source automatically. The output
+PLY remains static-only, while the prediction log reports the static and
+dynamic Gaussian counts for each chunk.
+
+To restrict `pa-multiview` to three cameras for lower memory use, repeat
+`--camera-id` in this exact order:
 
 ```bash
 --camera-id camera_front_50fov \
@@ -343,8 +353,8 @@ dynamic layers and the sky cubemap are the next development steps.
 | --- | --- | --- |
 | `--model` | `pa-front` | Input/checkpoint profile: `pa-front`, `pa-multiview`, or `pq-front`. |
 | `--ncore-path` | one input required | A `.json` file (single sequence) or a `.lst` manifest (one JSON path per line). Mutually exclusive with `--waymo-tfrecord`. |
-| `--waymo-ncore` | absent (false) | Select default sensor IDs emitted by NCore's official Waymo converter. Supports `pa-front` and `pa-multiview`; pass `--camera-id` repeatedly to select another supported camera set. |
-| `--waymo-tfrecord` | — | One `.tfrecord` segment to convert through the official NCore converter before prediction. Requires `--ncore-repo` and `--waymo-conversion-dir`; selects Waymo camera defaults automatically. |
+| `--waymo-ncore` | absent (false) | Select default sensor IDs emitted by NCore's official Waymo converter. `pa-multiview` uses all five cameras by default; pass `--camera-id` repeatedly to select one or three cameras instead. |
+| `--waymo-tfrecord` | — | One `.tfrecord` segment to convert through the official NCore converter before prediction. Requires `--ncore-repo` and `--waymo-conversion-dir`; selects all five Waymo cameras for `pa-multiview` automatically. |
 | `--ncore-repo` | — | Local `NVIDIA/ncore` source checkout used by the official Bazel conversion target. Only used with `--waymo-tfrecord`. |
 | `--waymo-conversion-dir` | — | Persistent directory holding NCore V4 conversion output for `--waymo-tfrecord`. |
 | `--force-waymo-conversion` | absent (false) | Recreate the NCore V4 output rather than reuse its metadata JSON. |

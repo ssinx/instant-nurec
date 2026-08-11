@@ -372,6 +372,11 @@ class KelvinDPTDecoder(nn.Module):
                 dynamic_track = CuboidTracks.Ops.subset_from_mask(
                     cuboid_tracks[bidx], cuboid_tracks[bidx].tracks_flags & TrackFlags.DYNAMIC != 0
                 )
+                if dynamic_track.n_tracks == 0:
+                    context_prev_flow_list.append(context_prev_flow[bidx])
+                    context_next_flow_list.append(context_next_flow[bidx])
+                    context_dynamic_mask_list.append(context_dynamic_mask[bidx])
+                    continue
                 context_xyz = (
                     pred_depth[bidx].detach()
                     / renderings[bidx].distance_to_depth_scale

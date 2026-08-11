@@ -170,6 +170,8 @@ class KelvinInferenceModel(nn.Module):
         dynamic_track = CuboidTracks.Ops.subset_from_mask(
             cuboid_tracks_b, cuboid_tracks_b.tracks_flags & TrackFlags.DYNAMIC != 0
         )
+        if dynamic_track.n_tracks == 0:
+            return semantic_v == self._semantic_movable_value()
 
         movable_mask = semantic_v == self._semantic_movable_value()
         rays = rendering_camera.rays  # (V, H, W, 6)

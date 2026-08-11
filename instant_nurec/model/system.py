@@ -97,6 +97,15 @@ class GaussiansInstantNuRecSystem(nn.Module):
                 primitives_chunk_list[i] = primitives_chunk_list[i].preprocess_for_export(
                     batch_chunk.context[i], self.export_preprocess, context_rig=context_rig_i
                 )
+                dynamic_gaussian_count = sum(
+                    dynamic_layer.max_densities.numel() for dynamic_layer in primitives_chunk_list[i].dynamic_layers
+                )
+                logger.info(
+                    "Prepared chunk %d with %d static and %d dynamic Gaussians.",
+                    inner_batch_idx + i,
+                    primitives_chunk_list[i].static_layer.densities.numel(),
+                    dynamic_gaussian_count,
+                )
                 if self.predict_config.input_camera_render.enabled:
                     meta = batch_chunk.meta[i] if batch_chunk.meta is not None else {}
                     sequence_id = meta.get("sequence_id", f"sample_{inner_batch_idx + i:04d}")
