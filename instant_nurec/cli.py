@@ -37,6 +37,8 @@ _WAYMO_NCORE_DEFAULT_CAMERA_IDS: dict[str, tuple[str, ...]] = {
         "camera_front_50fov",
         "camera_front_left_50fov",
         "camera_front_right_50fov",
+        "camera_side_left_50fov",
+        "camera_side_right_50fov",
     ),
 }
 
@@ -83,8 +85,7 @@ def make_parser() -> argparse.ArgumentParser:
         help=(
             "Treat --ncore-path as output from NVIDIA NCore's official Waymo "
             "TFRecord-to-NCore V4 converter. Without --camera-id, pa-front uses "
-            "camera_front_50fov and pa-multiview uses the front, front-left, and "
-            "front-right 50-degree cameras."
+            "camera_front_50fov and pa-multiview uses all five NCore Waymo camera IDs."
         ),
     )
     parser.add_argument(
@@ -190,6 +191,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from instant_nurec.config_schema.dataset import (
         AdaptiveSequentialFrameBatchSamplerConfig,
         InstantNuRecSplitsConfig,
+        NCoreInstantNuRecCuboidTracksParamsConfig,
         NCoreInstantNuRecDatasetConfig,
     )
     from instant_nurec.config_schema.instantnurec import InstantNuRecConfig
@@ -234,19 +236,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--ncore-repo, --waymo-conversion-dir, and --force-waymo-conversion require --waymo-tfrecord."
             )
         json_paths = resolve_ncore_paths(args.ncore_path)
-    dataset_config = NCoreInstantNuRecDatasetConfig(
-        ncore_json_paths=[str(p) for p in json_paths],
-        camera_subsampler={
+    dataset_config_kwargs = {
+        "ncore_json_paths": [str(p) for p in json_paths],
+        "camera_subsampler": {
             "frame_width": profile.frame_width,
             "frame_height": profile.frame_height,
         },
-        context_camera_ids=camera_ids,
-        supervision_camera_ids=camera_ids,
-        frame_batch_sampler=AdaptiveSequentialFrameBatchSamplerConfig(
+        "context_camera_ids": camera_ids,
+        "supervision_camera_ids": camera_ids,
+        "frame_batch_sampler": AdaptiveSequentialFrameBatchSamplerConfig(
             n_frames_per_sample=profile.n_frames_per_sample,
             n_samples_per_sequence=args.max_chunks,
         ),
-    )
+    }
+    if is_waymo_ncore:
+        dataset_config_kwargs["cuboid_tracks_params"] = NCoreInstantNuRecCuboidTracksParamsConfig(
+            track_label_source="EXTERNAL"
+        )
+    dataset_config = NCoreInstantNuRecDatasetConfig(**dataset_config_kwargs)
     allowed_camera_counts = profile.supported_camera_counts
     if len(camera_ids) not in allowed_camera_counts:
         counts = ", ".join(str(count) for count in allowed_camera_counts)
