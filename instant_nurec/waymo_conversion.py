@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import tempfile
 
@@ -90,6 +91,12 @@ def convert_waymo_tfrecord_to_ncore(
             return metadata_path
 
     existing_metadata_mtimes = {path: path.stat().st_mtime_ns for path in _metadata_paths(conversion_dir)}
+    bazel_command = shutil.which("bazel") or shutil.which("bazelisk")
+    if bazel_command is None:
+        raise WaymoConversionError(
+            "NVIDIA NCore's official Waymo converter requires Bazel or Bazelisk on PATH. "
+            "Install one, then rerun this command."
+        )
 
     with tempfile.TemporaryDirectory(prefix="instant_nurec_waymo_", dir=conversion_dir) as input_dir:
         staged_tfrecord = Path(input_dir) / tfrecord_path.name
@@ -101,7 +108,7 @@ def convert_waymo_tfrecord_to_ncore(
             ) from error
 
         command = [
-            "bazel",
+            bazel_command,
             "run",
             "//tools/data_converter/waymo:convert",
             "--",

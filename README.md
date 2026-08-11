@@ -274,7 +274,8 @@ instant-nurec \
 
 For one TFRecord, InstantNuRec can invoke the same official converter itself.
 It stages only that file in a temporary directory, so neighboring segments are
-not converted. This requires a local `NVIDIA/ncore` checkout with Bazel set up.
+not converted. This requires a local `NVIDIA/ncore` checkout and either
+`bazel` or `bazelisk` available on `PATH`.
 
 ```bash
 instant-nurec \
