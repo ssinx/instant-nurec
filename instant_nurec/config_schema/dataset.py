@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 
+from typing import Literal
+
 from instant_nurec.config_schema.base_schema import BaseConfigSchema, Field
 
 
