@@ -235,6 +235,79 @@ python run_inference.py \
 
 Output layout: PLYs only, under `out_dir/<run_id>/ply/<sequence_id>/...ply`.
 
+##### Waymo Open Dataset through the official NCore converter
+
+InstantNuRec does **not** parse Waymo TFRecords or the Waymo Open Dataset v2
+Parquet component tables itself. Convert the original Waymo **`.tfrecord`**
+sequences with NVIDIA NCore first, then pass the generated sequence metadata
+JSON to `--ncore-path`. The converter owns the Waymo-to-NCore camera-axis,
+extrinsics, timestamps, camera model, masks, and cuboid-label conversions.
+
+The v2 Parquet tree at `camera_image/`, `camera_calibration/`, and
+`vehicle_pose/` cannot be used as input to this official converter; obtain the
+matching Waymo TFRecord release for conversion.
+
+```bash
+git clone --recursive https://github.com/NVIDIA/ncore.git
+cd ncore
+
+# Run from the NCore repository root. This writes one NCore V4 metadata JSON
+# beside each converted sequence.
+bazel run //tools/data_converter/waymo:convert -- \
+    --root-dir /data/waymo/tfrecords/training \
+    --output-dir /data/ncore/waymo/training \
+    waymo-v4 --profile separate-sensors --world-global-mode localized
+```
+
+Then reconstruct a converted sequence. `--waymo-ncore` selects NCore's
+official Waymo sensor IDs in model order: front, front-left, front-right.
+
+```bash
+instant-nurec \
+    --model pa-multiview \
+    --waymo-ncore \
+    --ncore-path /data/ncore/waymo/training/<sequence-metadata>.json \
+    --output-dir ./waymo_output \
+    --merge \
+    --render-input-cameras
+```
+
+For one TFRecord, InstantNuRec can invoke the same official converter itself.
+It stages only that file in a temporary directory, so neighboring segments are
+not converted. This requires a local `NVIDIA/ncore` checkout with Bazel set up.
+
+```bash
+instant-nurec \
+    --model pa-multiview \
+    --waymo-tfrecord /data/datasets/waymo/waymo-open-dataset-v2.0.1/waymo-open-dataset-v1.4.3/testing/segment-17212025549630306883_2500_000_2520_000_with_camera_labels.tfrecord \
+    --ncore-repo /path/to/ncore \
+    --waymo-conversion-dir /data/ncore/waymo/testing \
+    --output-dir ./waymo_output \
+    --merge \
+    --render-input-cameras
+```
+
+The converted metadata is reused on later runs through a small mapping file in
+`--waymo-conversion-dir`; this avoids relying on the TFRecord filename because
+the official converter names output from Waymo's internal segment context ID.
+Add `--force-waymo-conversion` to recreate it after changing the source
+TFRecord or converter version.
+
+The official converter can also export all five cameras. To use five input
+views, repeat `--camera-id` in this exact order:
+
+```bash
+--camera-id camera_front_50fov \
+--camera-id camera_front_left_50fov \
+--camera-id camera_front_right_50fov \
+--camera-id camera_side_left_50fov \
+--camera-id camera_side_right_50fov
+```
+
+See the [NCore Waymo conversion guide](https://nvidia.github.io/ncore/conversions/waymo/waymo.html)
+and [converter implementation](https://github.com/NVIDIA/ncore/tree/main/tools/data_converter/waymo)
+for Bazel prerequisites and supported converter options.
+
 ##### Render source camera views
 
 For camera-pose and reconstruction-alignment checks, add
@@ -245,9 +318,8 @@ input frame plus a side-by-side `input | render` comparison under
 ```bash
 instant-nurec \
     --model pa-multiview \
-    --waymo-root /data/datasets/waymo/waymo-open-dataset-v2.0.1 \
-    --waymo-split training \
-    --waymo-segment-id <segment-id> \
+    --waymo-ncore \
+    --ncore-path /data/ncore/waymo/training/<sequence-metadata>.json \
     --output-dir ./waymo_output \
     --render-input-cameras
 ```
@@ -260,8 +332,8 @@ Install the renderer in the active environment before adding the flag:
 proxy pip install gsplat==1.5.3
 ```
 
-The current integration supports Waymo's OpenCV pinhole calibration, including
-radial, tangential, and thin-prism distortion. It renders the static layer;
+The official converter writes Waymo's OpenCV pinhole calibration after its
+camera-frame conversion. The renderer currently renders the static layer;
 dynamic layers and the sky cubemap are the next development steps.
 
 #### CLI reference
@@ -269,7 +341,12 @@ dynamic layers and the sky cubemap are the next development steps.
 | flag | default | purpose |
 | --- | --- | --- |
 | `--model` | `pa-front` | Input/checkpoint profile: `pa-front`, `pa-multiview`, or `pq-front`. |
-| `--ncore-path` | (required) | A `.json` file (single sequence) or a `.lst` manifest (one JSON path per line). |
+| `--ncore-path` | one input required | A `.json` file (single sequence) or a `.lst` manifest (one JSON path per line). Mutually exclusive with `--waymo-tfrecord`. |
+| `--waymo-ncore` | absent (false) | Select default sensor IDs emitted by NCore's official Waymo converter. Supports `pa-front` and `pa-multiview`; pass `--camera-id` repeatedly to select another supported camera set. |
+| `--waymo-tfrecord` | — | One `.tfrecord` segment to convert through the official NCore converter before prediction. Requires `--ncore-repo` and `--waymo-conversion-dir`; selects Waymo camera defaults automatically. |
+| `--ncore-repo` | — | Local `NVIDIA/ncore` source checkout used by the official Bazel conversion target. Only used with `--waymo-tfrecord`. |
+| `--waymo-conversion-dir` | — | Persistent directory holding NCore V4 conversion output for `--waymo-tfrecord`. |
+| `--force-waymo-conversion` | absent (false) | Recreate the NCore V4 output rather than reuse its metadata JSON. |
 | `--output-dir` | (required) | Directory the pipeline writes PLYs into. |
 | `--merge` | absent (false) | Boolean flag. When set, merges per-chunk primitives into a single frustum-ownership PLY per sequence (`<seq>.ply`) and runs kl-optimal voxelization (target count from `--n-gaussians`). Absent (default): per-chunk PLYs (`<seq>_chunk{N}.ply`), no voxelization. |
 | `--n-gaussians` | `2000000` | Target number of static Gaussians after voxelization. Only consulted when `--merge` is set. The voxel size is searched iteratively via bracketed binary search to land the count in `[0.9 * target, target]`. |

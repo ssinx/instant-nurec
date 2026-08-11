@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Standalone argparse CLI for NCore v4 and Waymo Open Dataset v2 inputs."""
+"""Standalone argparse CLI for NCore V4 inputs."""
 
 from __future__ import annotations
 
@@ -31,6 +31,14 @@ from instant_nurec.pretrained import (
 
 _DEFAULT_MAX_CHUNKS = 8
 _DEFAULT_N_GAUSSIANS = 2_000_000
+_WAYMO_NCORE_DEFAULT_CAMERA_IDS: dict[str, tuple[str, ...]] = {
+    "pa-front": ("camera_front_50fov",),
+    "pa-multiview": (
+        "camera_front_50fov",
+        "camera_front_left_50fov",
+        "camera_front_right_50fov",
+    ),
+}
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -62,24 +70,43 @@ def make_parser() -> argparse.ArgumentParser:
         ),
     )
     input_group.add_argument(
-        "--waymo-root",
+        "--waymo-tfrecord",
         type=Path,
-        help="Waymo Open Dataset v2 root containing split/component Parquet directories.",
+        help=(
+            "One Waymo TFRecord segment. It is converted with NVIDIA NCore's "
+            "official Bazel converter before prediction."
+        ),
     )
     parser.add_argument(
-        "--waymo-split",
-        choices=["training", "validation", "testing", "testing_location"],
-        default="validation",
-        help="Waymo v2 split used with --waymo-root. Default: validation.",
+        "--waymo-ncore",
+        action="store_true",
+        help=(
+            "Treat --ncore-path as output from NVIDIA NCore's official Waymo "
+            "TFRecord-to-NCore V4 converter. Without --camera-id, pa-front uses "
+            "camera_front_50fov and pa-multiview uses the front, front-left, and "
+            "front-right 50-degree cameras."
+        ),
     )
     parser.add_argument(
-        "--waymo-segment-id",
-        dest="waymo_segment_ids",
-        metavar="SEGMENT_ID",
-        type=str,
-        action="append",
-        default=None,
-        help="Waymo segment context name. Repeat to process multiple segments.",
+        "--ncore-repo",
+        type=Path,
+        help=(
+            "Path to an NVIDIA/ncore source checkout. Required with "
+            "--waymo-tfrecord."
+        ),
+    )
+    parser.add_argument(
+        "--waymo-conversion-dir",
+        type=Path,
+        help=(
+            "Directory for NCore V4 data created from --waymo-tfrecord. "
+            "Required with --waymo-tfrecord. Existing converted metadata is reused."
+        ),
+    )
+    parser.add_argument(
+        "--force-waymo-conversion",
+        action="store_true",
+        help="Re-run the official NCore converter even when its metadata JSON already exists.",
     )
     parser.add_argument(
         "--output-dir",
@@ -164,7 +191,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         AdaptiveSequentialFrameBatchSamplerConfig,
         InstantNuRecSplitsConfig,
         NCoreInstantNuRecDatasetConfig,
-        WaymoParquetInstantNuRecDatasetConfig,
     )
     from instant_nurec.config_schema.instantnurec import InstantNuRecConfig
     from instant_nurec.config_schema.models import (
@@ -179,45 +205,48 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     from instant_nurec.ncore_input import resolve_ncore_paths
     from instant_nurec.predict.run import run_predict
+    from instant_nurec.waymo_conversion import convert_waymo_tfrecord_to_ncore
 
     profile = get_model_profile(args.model)
-    if args.waymo_root is not None:
-        if profile.decoder_kind == "point-query":
-            raise ValueError("pq-front is only released for the NCore front-camera contract; use pa-multiview for Waymo.")
-        if not args.waymo_segment_ids:
-            raise ValueError("--waymo-segment-id is required when --waymo-root is used.")
-        camera_ids = list(args.camera_ids or ["FRONT", "FRONT_LEFT", "FRONT_RIGHT"])
-        dataset_config = WaymoParquetInstantNuRecDatasetConfig(
-            waymo_root=str(args.waymo_root),
-            split=args.waymo_split,
-            segment_ids=args.waymo_segment_ids,
-            camera_subsampler={
-                "frame_width": profile.frame_width,
-                "frame_height": profile.frame_height,
-            },
-            context_camera_ids=camera_ids,
-            supervision_camera_ids=camera_ids,
-            frame_batch_sampler=AdaptiveSequentialFrameBatchSamplerConfig(
-                n_frames_per_sample=profile.n_frames_per_sample,
-                n_samples_per_sequence=args.max_chunks,
-            ),
+    is_waymo_ncore = args.waymo_ncore or args.waymo_tfrecord is not None
+    if is_waymo_ncore and profile.decoder_kind == "point-query":
+        raise ValueError(
+            "pq-front requires the released PAI front-camera contract; use pa-front or pa-multiview for Waymo."
         )
+    default_camera_ids = (
+        _WAYMO_NCORE_DEFAULT_CAMERA_IDS[args.model] if is_waymo_ncore else profile.context_camera_ids
+    )
+    camera_ids = list(args.camera_ids or default_camera_ids)
+    if args.waymo_tfrecord is not None:
+        if args.ncore_repo is None or args.waymo_conversion_dir is None:
+            raise ValueError("--ncore-repo and --waymo-conversion-dir are required with --waymo-tfrecord.")
+        json_paths = [
+            convert_waymo_tfrecord_to_ncore(
+                args.waymo_tfrecord,
+                args.ncore_repo,
+                args.waymo_conversion_dir,
+                force=args.force_waymo_conversion,
+            )
+        ]
     else:
+        if args.ncore_repo is not None or args.waymo_conversion_dir is not None or args.force_waymo_conversion:
+            raise ValueError(
+                "--ncore-repo, --waymo-conversion-dir, and --force-waymo-conversion require --waymo-tfrecord."
+            )
         json_paths = resolve_ncore_paths(args.ncore_path)
-        camera_ids = list(args.camera_ids or profile.context_camera_ids)
-        dataset_config = NCoreInstantNuRecDatasetConfig(
-            ncore_json_paths=[str(p) for p in json_paths],
-            camera_subsampler={
-                "frame_width": profile.frame_width,
-                "frame_height": profile.frame_height,
-            },
-            context_camera_ids=camera_ids,
-            supervision_camera_ids=camera_ids,
-            frame_batch_sampler=AdaptiveSequentialFrameBatchSamplerConfig(
-                n_frames_per_sample=profile.n_frames_per_sample,
-                n_samples_per_sequence=args.max_chunks,
-            ),
-        )
+    dataset_config = NCoreInstantNuRecDatasetConfig(
+        ncore_json_paths=[str(p) for p in json_paths],
+        camera_subsampler={
+            "frame_width": profile.frame_width,
+            "frame_height": profile.frame_height,
+        },
+        context_camera_ids=camera_ids,
+        supervision_camera_ids=camera_ids,
+        frame_batch_sampler=AdaptiveSequentialFrameBatchSamplerConfig(
+            n_frames_per_sample=profile.n_frames_per_sample,
+            n_samples_per_sequence=args.max_chunks,
+        ),
+    )
     allowed_camera_counts = profile.supported_camera_counts
     if len(camera_ids) not in allowed_camera_counts:
         counts = ", ".join(str(count) for count in allowed_camera_counts)
