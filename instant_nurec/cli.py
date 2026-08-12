@@ -113,7 +113,7 @@ def make_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         required=True,
-        help="Directory for PLY output.",
+        help="Directory for PLY and sky-output bundles.",
     )
     parser.add_argument(
         "--merge",
@@ -175,6 +175,26 @@ def make_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--render-preview",
+        action="store_true",
+        help=(
+            "Render the first context frame of each output chunk as a PNG, "
+            "using its calibrated NCore F-theta model and rolling-shutter poses and "
+            "compositing the observation-derived sky behind the Gaussians. "
+            "Install with `uv sync --extra render` first."
+        ),
+    )
+    parser.add_argument(
+        "--render-video",
+        action="store_true",
+        help=(
+            "Render every original frame from the first context camera as an H.264 MP4, "
+            "using the source F-theta calibration, exposure trajectory, and sky. Requires "
+            "one resolved sequence, --merge, enough --max-chunks for full coverage, "
+            "`uv sync --extra render`, and ffmpeg with libx264."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         default="INFO",
@@ -184,8 +204,30 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = make_parser().parse_args(argv)
+    parser = make_parser()
+    args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
+
+    if args.render_video and not args.merge:
+        parser.error("--render-video requires --merge so one complete scene is rendered")
+    if args.max_chunks <= 0:
+        parser.error("--max-chunks must be greater than zero")
+
+    if args.render_preview or args.render_video:
+        from instant_nurec.predict.render_preview import require_gsplat
+
+        try:
+            require_gsplat()
+        except RuntimeError as exc:
+            parser.error(str(exc))
+
+    if args.render_video:
+        from instant_nurec.predict.render_video import require_ffmpeg
+
+        try:
+            require_ffmpeg()
+        except RuntimeError as exc:
+            parser.error(str(exc))
 
     # Lazy imports keep argparse-only invocations (e.g. --help) cheap.
     from instant_nurec.config_schema.dataset import (
@@ -194,7 +236,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         NCoreInstantNuRecCuboidTracksParamsConfig,
         NCoreInstantNuRecDatasetConfig,
     )
-    from instant_nurec.config_schema.instantnurec import InstantNuRecConfig
+    from instant_nurec.config_schema.instantnurec import (
+        GaussiansInstantNuRecSystemConfig,
+        InstantNuRecConfig,
+    )
     from instant_nurec.config_schema.models import (
         KelvinDPTDecoderConfig,
         KelvinModelConfig,
@@ -236,6 +281,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--ncore-repo, --waymo-conversion-dir, and --force-waymo-conversion require --waymo-tfrecord."
             )
         json_paths = resolve_ncore_paths(args.ncore_path)
+    if args.render_video and len(json_paths) != 1:
+        parser.error(
+            "--render-video currently requires exactly one resolved NCore sequence "
+            "so all requested chunks are merged into one complete scene"
+        )
     dataset_config_kwargs = {
         "ncore_json_paths": [str(p) for p in json_paths],
         "camera_subsampler": {
@@ -271,6 +321,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = InstantNuRecConfig(
         out_dir=str(args.output_dir),
         release_profile=args.model,
+        system=(
+            GaussiansInstantNuRecSystemConfig(predict_batch_size=args.max_chunks)
+            if args.render_video
+            else GaussiansInstantNuRecSystemConfig()
+        ),
         model=KelvinModelConfig(
             decoder=decoder_config,
         ),
@@ -286,6 +341,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             input_camera_render=InputCameraRenderConfig(
                 enabled=args.render_input_cameras,
             ),
+            render_preview=args.render_preview,
+            render_video=args.render_video,
         ),
     )
     run_predict(config)

@@ -14,7 +14,7 @@ import torch
 
 from PIL import Image
 
-from instant_nurec.primitives.kelvin_primitive import KelvinInstantNuRecPrimitive
+from instant_nurec.primitives.kelvin_primitive import KelvinDynamicLayer, KelvinInstantNuRecPrimitive
 from instant_nurec.utils.batch import DataAndRenderingBatch
 from instant_nurec.utils.geometry import tquat_to_se3_matrix
 from instant_nurec.utils.misc import unpack_optional
@@ -79,6 +79,36 @@ def _distortion_kwargs(camera_model_parameters: object, rasterization: Callable,
 
 
 @torch.inference_mode()
+def _dynamic_positions_at_timestamp(
+    dynamic_layer: KelvinDynamicLayer,
+    timestamp_us: int | torch.Tensor,
+) -> torch.Tensor:
+    """Piecewise-linearly interpolate a dynamic layer at one render time."""
+    if len(dynamic_layer) == 0:
+        return dynamic_layer.keyframe_positions[:, 1]
+    timestamp = torch.as_tensor(
+        timestamp_us,
+        device=dynamic_layer.keyframe_timestamps_us.device,
+        dtype=dynamic_layer.keyframe_timestamps_us.dtype,
+    )
+    keyframe_times = dynamic_layer.keyframe_timestamps_us
+    keyframe_positions = dynamic_layer.keyframe_positions
+    use_first_segment = timestamp <= keyframe_times[:, 1]
+    left_indices = torch.where(use_first_segment, 0, 1)
+    right_indices = left_indices + 1
+    row_indices = torch.arange(len(dynamic_layer), device=keyframe_times.device)
+    left_times = keyframe_times[row_indices, left_indices]
+    right_times = keyframe_times[row_indices, right_indices]
+    alpha = (timestamp - left_times).to(keyframe_positions.dtype) / (right_times - left_times).clamp_min(1).to(
+        keyframe_positions.dtype
+    )
+    alpha = alpha.clamp_(0.0, 1.0).unsqueeze(-1)
+    left_positions = keyframe_positions[row_indices, left_indices]
+    right_positions = keyframe_positions[row_indices, right_indices]
+    return torch.lerp(left_positions, right_positions, alpha)
+
+
+@torch.inference_mode()
 def render_static_gaussians(
     primitive: KelvinInstantNuRecPrimitive,
     *,
@@ -86,8 +116,9 @@ def render_static_gaussians(
     camera_model_parameters: object,
     height: int,
     width: int,
+    timestamp_us: int | torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Render learned anisotropic static Gaussians with alpha compositing."""
+    """Render static Gaussians and, when timed, interpolated dynamic Gaussians."""
     if height <= 0 or width <= 0:
         raise ValueError(f"Image dimensions must be positive, got {width}x{height}")
     if type(camera_model_parameters).__name__ != "OpenCVPinholeCameraModelParameters":
@@ -99,7 +130,26 @@ def render_static_gaussians(
     rasterization = _require_gsplat()
     static_layer = primitive.static_layer
     device = static_layer.positions.device
-    if len(static_layer) == 0:
+    positions = [static_layer.positions]
+    rotations = [static_layer.rotations]
+    scales = [static_layer.scales]
+    opacities = [static_layer.densities]
+    colors = [static_layer.rgb]
+    if timestamp_us is not None:
+        for dynamic_layer in primitive.dynamic_layers:
+            if len(dynamic_layer) == 0:
+                continue
+            positions.append(_dynamic_positions_at_timestamp(dynamic_layer, timestamp_us))
+            rotations.append(dynamic_layer.rotations)
+            scales.append(dynamic_layer.scales)
+            opacities.append(dynamic_layer.max_densities)
+            colors.append(dynamic_layer.rgb)
+    means = torch.cat(positions, dim=0)
+    quaternions = torch.cat(rotations, dim=0)
+    gaussian_scales = torch.cat(scales, dim=0)
+    gaussian_opacities = torch.cat(opacities, dim=0)
+    gaussian_colors = torch.cat(colors, dim=0)
+    if means.numel() == 0:
         return torch.zeros((height, width, 3), device=device, dtype=torch.float32)
     viewmat = torch.linalg.inv(T_sensor_scene.to(device=device, dtype=torch.float32)).unsqueeze(0).contiguous()
     intrinsics = _pinhole_intrinsics(camera_model_parameters, device).unsqueeze(0).contiguous()
@@ -107,11 +157,11 @@ def render_static_gaussians(
     with_ut = bool(distortion_kwargs)
 
     rendered, _, _ = rasterization(
-        means=static_layer.positions.float().contiguous(),
-        quats=static_layer.rotations.float().contiguous(),
-        scales=static_layer.scales.float().contiguous(),
-        opacities=static_layer.densities[:, 0].float().contiguous(),
-        colors=static_layer.rgb.float().contiguous(),
+        means=means.float().contiguous(),
+        quats=quaternions.float().contiguous(),
+        scales=gaussian_scales.float().contiguous(),
+        opacities=gaussian_opacities[:, 0].float().contiguous(),
+        colors=gaussian_colors.float().contiguous(),
         viewmats=viewmat,
         Ks=intrinsics,
         width=width,
@@ -158,14 +208,15 @@ def render_input_camera_frames(
             rendering_camera.poses_tquat_startend[frame_idx, 1],
             unbatch=True,
         ).to(device=primitive.device(), dtype=torch.float32)
+        timestamp_us = int(rendering_camera.timestamps_startend_us_cpu[frame_idx, 1].item())
         rendered_image = render_static_gaussians(
             primitive,
             T_sensor_scene=T_sensor_scene,
             camera_model_parameters=rendering_camera.sensor_model_parameters[frame_idx],
             height=height,
             width=width,
+            timestamp_us=timestamp_us,
         )
-        timestamp_us = int(rendering_camera.timestamps_startend_us_cpu[frame_idx, 1].item())
         camera_name = camera_names_by_index.get(
             frame_meta.unique_sensor_idx,
             f"camera_{frame_meta.unique_sensor_idx}",

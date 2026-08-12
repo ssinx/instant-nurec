@@ -23,7 +23,11 @@ from pathlib import Path
 import torch
 
 from instant_nurec.utils.gaussians.utils import RGB2SH, write_ply_3dgs
-from instant_nurec.primitives.kelvin_primitive import KelvinInstantNuRecPrimitive, KelvinSemanticClass
+from instant_nurec.primitives.kelvin_primitive import (
+    KelvinDynamicLayer,
+    KelvinInstantNuRecPrimitive,
+    KelvinSemanticClass,
+)
 from instant_nurec.utils.types import RigTrajectories
 
 
@@ -100,7 +104,55 @@ def export_kelvin_ply(primitives: KelvinInstantNuRecPrimitive) -> PLYExportGauss
     )
 
 
-def export_ply(primitives: KelvinInstantNuRecPrimitive, rig_trajectories: RigTrajectories, path: Path) -> None:
+def _dynamic_positions_at_timestamp(
+    dynamic_layer: KelvinDynamicLayer,
+    timestamp_us: torch.Tensor,
+) -> torch.Tensor:
+    keyframe_times = dynamic_layer.keyframe_timestamps_us
+    keyframe_positions = dynamic_layer.keyframe_positions
+    use_first_segment = timestamp_us <= keyframe_times[:, 1]
+    left_indices = torch.where(use_first_segment, 0, 1)
+    right_indices = left_indices + 1
+    row_indices = torch.arange(len(dynamic_layer), device=keyframe_times.device)
+    left_times = keyframe_times[row_indices, left_indices]
+    right_times = keyframe_times[row_indices, right_indices]
+    alpha = (timestamp_us - left_times).to(keyframe_positions.dtype) / (right_times - left_times).clamp_min(1).to(
+        keyframe_positions.dtype
+    )
+    alpha = alpha.clamp_(0.0, 1.0).unsqueeze(-1)
+    return torch.lerp(
+        keyframe_positions[row_indices, left_indices],
+        keyframe_positions[row_indices, right_indices],
+        alpha,
+    )
+
+
+def export_dynamic_ply(primitives: KelvinInstantNuRecPrimitive, output_path: Path) -> int:
+    """Write a standard 3DGS snapshot of all dynamic layers at their median source time."""
+    dynamic_layers = [layer for layer in primitives.dynamic_layers if len(layer) > 0]
+    if not dynamic_layers:
+        return 0
+    source_timestamps_us = torch.cat([layer.keyframe_timestamps_us[:, 1] for layer in dynamic_layers])
+    reference_timestamp_us = torch.median(source_timestamps_us)
+    positions = torch.cat(
+        [_dynamic_positions_at_timestamp(layer, reference_timestamp_us) for layer in dynamic_layers], dim=0
+    )
+    rotations = torch.cat([layer.rotations for layer in dynamic_layers], dim=0)
+    scales = torch.cat([layer.scales for layer in dynamic_layers], dim=0)
+    densities = torch.cat([layer.max_densities for layer in dynamic_layers], dim=0)
+    rgb = torch.cat([layer.rgb for layer in dynamic_layers], dim=0)
+    finite_mask = torch.isfinite(densities).squeeze(-1)
+    PLYExportGaussians(
+        positions=positions[finite_mask],
+        rotations=rotations[finite_mask],
+        scales=scales[finite_mask],
+        densities=densities[finite_mask],
+        rgb=rgb[finite_mask],
+    ).export(output_path)
+    return int(finite_mask.sum().item())
+
+
+def export_ply(primitives: KelvinInstantNuRecPrimitive, rig_trajectories: RigTrajectories, path: Path) -> int:
     """Export the InstantNuRec Primitives as a ply file after transforming to world space and applying some filtering.
     This ply export is intended to be used as an initialization for NuRec SO.
     """
@@ -113,3 +165,4 @@ def export_ply(primitives: KelvinInstantNuRecPrimitive, rig_trajectories: RigTra
 
     gaussians_ply = export_kelvin_ply(primitives)
     gaussians_ply.export(path)
+    return export_dynamic_ply(primitives, path.with_name(f"{path.stem}_dynamic{path.suffix}"))

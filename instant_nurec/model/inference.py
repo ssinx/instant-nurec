@@ -1,30 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-"""Public eager-mode InstantNuRec inference model.
-
-Applies semantic + optional cuboid-track-based dynamic-mask refinement
-to the per-pixel outputs and packages them into
-``KelvinInstantNuRecPrimitive``. Sky cubemap and dynamic-layer slots
-are filled with zero placeholders to satisfy the primitive invariants
-and the chunk-merge code path; ``export_ply.py`` reads only
-``static_layer``.
-"""
+"""Eager inference wrapper that packages learned static and dynamic Gaussians."""
 
 from __future__ import annotations
 
+import logging
 import math
 
 import torch
@@ -42,28 +23,16 @@ from instant_nurec.primitives.kelvin_primitive import (
 from instant_nurec.utils.batch import DataAndRenderingBatch
 from instant_nurec.utils.geometry import tquat_to_se3_matrix
 from instant_nurec.utils.misc import unpack_optional
-from instant_nurec.utils.motion import warp_points_with_cuboid_tracks
+from instant_nurec.utils.motion import TimeRemapping, warp_points_with_cuboid_tracks
 from instant_nurec.utils.sensor import to_simple_pinhole_model_parameters
 from instant_nurec.utils.types import TrackFlags
 
 
-# Cubemap placeholder size: small enough to keep memory negligible, large
-# enough that the merge code's per-pixel arithmetic produces well-defined
-# results. The merged cubemap is computed but never written -- ``export_ply.py``
-# only reads ``static_layer``.
-_PLACEHOLDER_SKY_CUBEMAP_SIZE = 16
+logger = logging.getLogger(__name__)
 
 
 class KelvinInferenceModel(nn.Module):
-    """Wrap the eager model core and package its tensor outputs.
-
-    Args:
-        static_core: Source-defined encoder, decoder, and post-processing core.
-        scene_rescale: Scale factor used by the released model.
-        expected_frames: Number of input frames per inference sample.
-        expected_height: Input image height after preprocessing.
-        expected_width: Input image width after preprocessing.
-    """
+    """Run the released heads and package static/dynamic Gaussian layers."""
 
     def __init__(
         self,
@@ -92,127 +61,81 @@ class KelvinInferenceModel(nn.Module):
         expected = (self.expected_b, self.expected_v, self.expected_h, self.expected_w, 3)
         if (b, v, h, w, c) != expected:
             raise ValueError(
-                f"Input shape mismatch: got rgb {tuple(rgb.shape)}, "
-                f"expected {expected}. Model expects {self.expected_v} "
-                f"input frames at {self.expected_h}x{self.expected_w}; "
-                f"check that ``len(context_camera_ids) * n_frames_per_sample`` "
-                f"equals {self.expected_v}."
+                f"Input shape mismatch: got rgb {tuple(rgb.shape)}, expected {expected}. "
+                f"Model expects {self.expected_v} input frames at {self.expected_h}x{self.expected_w}; "
+                "check that len(context_camera_ids) * n_frames_per_sample equals the expected frame count."
             )
 
-    def prepare_context(
-        self,
-        context: list[DataAndRenderingBatch],
-    ) -> list[DataAndRenderingBatch]:
+    def prepare_context(self, context: list[DataAndRenderingBatch]) -> list[DataAndRenderingBatch]:
         return context
 
-    # ------------------------------------------------------------------
-    # reconstruct: tensor extraction and primitive packaging
-    # ------------------------------------------------------------------
-
     def _extract_tensors(self, batch: DataAndRenderingBatch):
-        """Extract the model's input tensors from a single
-        ``DataAndRenderingBatch`` (chunk_size=1)."""
+        """Extract tensors and derive the three timestamps used by the motion head."""
         data = unpack_optional(batch.data.camera)
         rendering = unpack_optional(unpack_optional(batch.rendering).camera)
 
-        rgb = unpack_optional(data.labels.rgb).unsqueeze(0)  # (1, V, H, W, 3)
-        rays = rendering.rays.unsqueeze(0)  # (1, V, H, W, 6)
+        rgb = unpack_optional(data.labels.rgb).unsqueeze(0)
+        rays = rendering.rays.unsqueeze(0)
         distance_to_depth_scale = rendering.distance_to_depth_scale.unsqueeze(0)
 
-        c2w = tquat_to_se3_matrix(rendering.poses_tquat_startend[:, 1, :], unbatch=False)
-        c2w = c2w.clone()
+        c2w = tquat_to_se3_matrix(rendering.poses_tquat_startend[:, 1, :], unbatch=False).clone()
         c2w[:, :3, 3] *= self.scene_rescale
-        c2w = c2w.unsqueeze(0)  # (1, V, 4, 4)
+        c2w = c2w.unsqueeze(0)
 
         pinhole_parameters = [
-            to_simple_pinhole_model_parameters(rendering.sensor_model_parameters[vidx])
-            for vidx in range(data.b)
+            to_simple_pinhole_model_parameters(rendering.sensor_model_parameters[frame_idx])
+            for frame_idx in range(data.b)
         ]
-        fov_list = []
-        for p in pinhole_parameters:
-            fov_w = 2 * math.atan2(p.resolution[0] / 2, p.focal_length[0])
-            fov_h = 2 * math.atan2(p.resolution[1] / 2, p.focal_length[1])
-            fov_list.append([fov_w, fov_h])
-        fov = torch.tensor(fov_list, dtype=torch.float32, device=rgb.device).unsqueeze(0)
+        fov = torch.tensor(
+            [
+                [
+                    2 * math.atan2(parameters.resolution[0] / 2, parameters.focal_length[0]),
+                    2 * math.atan2(parameters.resolution[1] / 2, parameters.focal_length[1]),
+                ]
+                for parameters in pinhole_parameters
+            ],
+            dtype=torch.float32,
+            device=rgb.device,
+        ).unsqueeze(0)
+        camera_idxs = torch.tensor(
+            [meta.unique_sensor_idx for meta in data.meta], dtype=torch.int64, device=rgb.device
+        ).unsqueeze(0)
 
-        camera_idxs = (
-            torch.tensor([meta.unique_sensor_idx for meta in data.meta], dtype=torch.int64)
-            .to(rgb.device)
-            .unsqueeze(0)
+        source_timestamps_us = unpack_optional(rendering.rays_timestamps_us).unsqueeze(0)
+        time_remapping = TimeRemapping.from_timestamps_startend_us(
+            rendering.timestamps_startend_us_cpu,
+            camera_idxs[0].cpu(),
         )
+        frame_gaps_us = time_remapping.frame_gap_timestamps_us.to(rgb.device)
+        prev_target_timestamps_us = source_timestamps_us - frame_gaps_us[None, :, 0, None, None, None]
+        next_target_timestamps_us = source_timestamps_us + frame_gaps_us[None, :, 1, None, None, None]
 
-        return rgb, c2w, fov, rays, distance_to_depth_scale, camera_idxs
-
-    def _compute_dynamic_mask(
-        self,
-        gs_xyz: torch.Tensor,
-        semantic_argmax: torch.Tensor,
-        rendering_camera,
-        cuboid_tracks_b: CuboidTracks | None,
-        source_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Compute the dynamic mask.
-
-        Without ``cuboid_tracks_b``: dynamic_mask is purely the semantic
-        argmax-equals-MOVABLE.
-
-        With ``cuboid_tracks_b``: refine via point-cuboid intersection
-        (and fallback ray-cuboid intersection on movable rays).
-        """
-        # Single-batch slice: dense outputs have shapes (V, H, W, 3) and
-        # (V, H, W); point-query outputs have shapes (N, 3) and (N,).
-        gs_xyz_v = gs_xyz[0]
-        semantic_v = semantic_argmax[0]
-
-        if cuboid_tracks_b is None:
-            return semantic_v == self._semantic_movable_value()
-
-        dynamic_track = CuboidTracks.Ops.subset_from_mask(
-            cuboid_tracks_b, cuboid_tracks_b.tracks_flags & TrackFlags.DYNAMIC != 0
+        return (
+            rgb,
+            c2w,
+            fov,
+            rays,
+            distance_to_depth_scale,
+            camera_idxs,
+            source_timestamps_us,
+            prev_target_timestamps_us,
+            next_target_timestamps_us,
+            [time_remapping],
         )
-        if dynamic_track.n_tracks == 0:
-            return semantic_v == self._semantic_movable_value()
-
-        movable_mask = semantic_v == self._semantic_movable_value()
-        rays = rendering_camera.rays  # (V, H, W, 6)
-        ray_ts = unpack_optional(rendering_camera.rays_timestamps_us)  # (V, H, W, 1)
-        if source_indices is not None:
-            # The sparse decoder carries each Gaussian's flattened source-pixel
-            # index so cuboid-track association uses the aligned ray and time.
-            source_indices_v = source_indices[0].long()
-            rays = rays.reshape(-1, 6)[source_indices_v]
-            ray_ts = ray_ts.reshape(-1, 1)[source_indices_v]
-
-        aux_ray_intersection_result = dynamic_track.ray_intersection(
-            rays[..., :3][movable_mask],
-            rays[..., 3:][movable_mask],
-            ray_ts[..., 0][movable_mask],
-            max_intersections_per_ray=2,
-        )
-        aux_movable_tracks_idx = aux_ray_intersection_result.intersections_tracks_idx[..., 0]
-        aux_movable_tracks_idx[aux_ray_intersection_result.intersections_cnt != 1] = -1
-        aux_tracks_idx = torch.full_like(movable_mask, -1, dtype=aux_movable_tracks_idx.dtype)
-        aux_tracks_idx[movable_mask] = aux_movable_tracks_idx
-
-        prev_target_ts = ray_ts.clone()  # placeholder -- only dynamic_mask is used downstream
-        next_target_ts = ray_ts.clone()
-        dynamic_mask, _ = warp_points_with_cuboid_tracks(
-            points=gs_xyz_v,
-            source_timestamps_us=ray_ts,
-            target_timestamps_us_list=[prev_target_ts, next_target_ts],
-            dynamic_tracks=dynamic_track,
-            aux_tracks_idx=aux_tracks_idx,
-            cuboids_dims_padding=self.cuboids_dims_padding,
-        )
-        return dynamic_mask
 
     @staticmethod
     def _semantic_movable_value() -> int:
         return KelvinSemanticClass.MOVABLE.value
 
+    @staticmethod
+    def _gather_source_pixels(values: torch.Tensor, source_indices: torch.Tensor | None) -> torch.Tensor:
+        """Flatten a dense ``(B,V,H,W,C)`` field to the emitted Gaussian order."""
+        flattened = values[0].reshape(-1, *values.shape[4:])
+        if source_indices is None:
+            return flattened
+        return flattened[source_indices[0].reshape(-1).long()]
+
     def _empty_dynamic_layer(self, device: torch.device) -> KelvinDynamicLayer:
-        """Zero-gaussian KelvinDynamicLayer placeholder. Required because
-        ``KelvinPrimitiveMerge`` asserts ``len(primitive.dynamic_layers) == 1``."""
         return KelvinDynamicLayer(
             max_densities=torch.zeros(0, 1, device=device),
             keyframe_positions=torch.zeros(0, 3, 3, device=device),
@@ -222,9 +145,51 @@ class KelvinInferenceModel(nn.Module):
             rgb=torch.zeros(0, 3, device=device),
         )
 
-    def _placeholder_sky_cubemap(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        s = _PLACEHOLDER_SKY_CUBEMAP_SIZE
-        return torch.zeros(6, s, s, 3, device=device, dtype=dtype)
+    def _refine_dynamic_motion(
+        self,
+        *,
+        positions: torch.Tensor,
+        semantic_class: torch.Tensor,
+        predicted_prev_positions: torch.Tensor,
+        predicted_next_positions: torch.Tensor,
+        rays: torch.Tensor,
+        source_timestamps_us: torch.Tensor,
+        prev_target_timestamps_us: torch.Tensor,
+        next_target_timestamps_us: torch.Tensor,
+        cuboid_tracks: CuboidTracks | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prefer cuboid-track motion, otherwise retain learned semantic/motion outputs."""
+        learned_dynamic_mask = semantic_class == self._semantic_movable_value()
+        if cuboid_tracks is None:
+            return learned_dynamic_mask, predicted_prev_positions, predicted_next_positions
+
+        dynamic_tracks = CuboidTracks.Ops.subset_from_mask(
+            cuboid_tracks, cuboid_tracks.tracks_flags & TrackFlags.DYNAMIC != 0
+        )
+        if dynamic_tracks.n_tracks == 0:
+            return learned_dynamic_mask, predicted_prev_positions, predicted_next_positions
+
+        auxiliary_track_indices = torch.full_like(learned_dynamic_mask, -1, dtype=torch.int64)
+        if learned_dynamic_mask.any():
+            intersections = dynamic_tracks.ray_intersection(
+                rays[learned_dynamic_mask, :3],
+                rays[learned_dynamic_mask, 3:],
+                source_timestamps_us[learned_dynamic_mask],
+                max_intersections_per_ray=2,
+            )
+            track_indices = intersections.intersections_tracks_idx[..., 0]
+            track_indices[intersections.intersections_cnt != 1] = -1
+            auxiliary_track_indices[learned_dynamic_mask] = track_indices
+
+        dynamic_mask, (previous_positions, next_positions) = warp_points_with_cuboid_tracks(
+            points=positions,
+            source_timestamps_us=source_timestamps_us,
+            target_timestamps_us_list=[prev_target_timestamps_us, next_target_timestamps_us],
+            dynamic_tracks=dynamic_tracks,
+            aux_tracks_idx=auxiliary_track_indices,
+            cuboids_dims_padding=self.cuboids_dims_padding,
+        )
+        return dynamic_mask, previous_positions, next_positions
 
     def reconstruct(
         self,
@@ -232,64 +197,97 @@ class KelvinInferenceModel(nn.Module):
         cuboid_tracks: list[CuboidTracks] | None = None,
     ) -> list[KelvinInstantNuRecPrimitive]:
         primitives: list[KelvinInstantNuRecPrimitive] = []
-        for bidx, batch in enumerate(context):
+        for batch_index, batch in enumerate(context):
             tensors = self._extract_tensors(batch)
             self._validate_input_shape(tensors[0])
-            static_output = self.static_core(*tensors)
-            if isinstance(static_output, KelvinPointQueryStaticOutput):
-                gs_xyz = static_output.positions
-                gs_rotations = static_output.rotations
-                gs_scales = static_output.scales
-                gs_densities = static_output.densities
-                gs_rgb = static_output.rgb
-                semantic_argmax = static_output.semantic_class
-                normals = static_output.normals
-                affine = static_output.affine_matrix
-                source_indices = static_output.source_indices
-            else:
-                (
-                    gs_xyz,
-                    gs_rotations,
-                    gs_scales,
-                    gs_densities,
-                    gs_rgb,
-                    semantic_argmax,
-                    normals,
-                    affine,
-                ) = static_output
-                source_indices = None
+            output = self.static_core(*tensors)
+            source_indices = output.source_indices if isinstance(output, KelvinPointQueryStaticOutput) else None
 
-            rendering_camera = unpack_optional(unpack_optional(batch.rendering).camera)
-            cuboid_tracks_b = cuboid_tracks[bidx] if cuboid_tracks is not None else None
-            dynamic_mask = self._compute_dynamic_mask(
-                gs_xyz,
-                semantic_argmax,
-                rendering_camera,
-                cuboid_tracks_b,
-                source_indices,
+            positions = output.positions[0].reshape(-1, 3)
+            rotations = output.rotations[0].reshape(-1, 4)
+            scales = output.scales[0].reshape(-1, 3)
+            densities = output.densities[0].reshape(-1, 1)
+            rgb = output.rgb[0].reshape(-1, 3)
+            semantic_class = output.semantic_class[0].reshape(-1)
+            normals = output.normals[0].reshape(-1, 3)
+            prev_flow = self._gather_source_pixels(output.prev_flow, source_indices)
+            next_flow = self._gather_source_pixels(output.next_flow, source_indices)
+            source_timestamps_us = self._gather_source_pixels(output.source_timestamps_us, source_indices).squeeze(-1)
+            prev_target_timestamps_us = self._gather_source_pixels(
+                output.prev_target_timestamps_us, source_indices
+            ).squeeze(-1)
+            next_target_timestamps_us = self._gather_source_pixels(
+                output.next_target_timestamps_us, source_indices
+            ).squeeze(-1)
+            rays = self._gather_source_pixels(tensors[3], source_indices)
+
+            dynamic_mask, previous_positions, next_positions = self._refine_dynamic_motion(
+                positions=positions,
+                semantic_class=semantic_class,
+                predicted_prev_positions=positions + prev_flow,
+                predicted_next_positions=positions + next_flow,
+                rays=rays,
+                source_timestamps_us=source_timestamps_us,
+                prev_target_timestamps_us=prev_target_timestamps_us,
+                next_target_timestamps_us=next_target_timestamps_us,
+                cuboid_tracks=cuboid_tracks[batch_index] if cuboid_tracks is not None else None,
+            )
+            class_counts = torch.bincount(semantic_class, minlength=len(KelvinSemanticClass))
+            logger.info(
+                "Semantic Gaussians in chunk %d: others=%d ego=%d sky=%d road=%d movable=%d; dynamic=%d.",
+                batch_index,
+                class_counts[KelvinSemanticClass.OTHERS].item(),
+                class_counts[KelvinSemanticClass.EGO].item(),
+                class_counts[KelvinSemanticClass.SKY].item(),
+                class_counts[KelvinSemanticClass.ROAD].item(),
+                class_counts[KelvinSemanticClass.MOVABLE].item(),
+                dynamic_mask.sum().item(),
             )
 
-            # Flatten and gather static-only.
-            dynamic_mask_flat = dynamic_mask.reshape(-1)
-            static_idx = torch.where(~dynamic_mask_flat)[0]
+            static_indices = torch.where(~dynamic_mask)[0]
+            dynamic_indices = torch.where(dynamic_mask)[0]
             static_layer = KelvinStaticLayer(
-                positions=gs_xyz[0].reshape(-1, 3)[static_idx],
-                rotations=gs_rotations[0].reshape(-1, 4)[static_idx],
-                scales=gs_scales[0].reshape(-1, 3)[static_idx],
-                densities=gs_densities[0].reshape(-1, 1)[static_idx],
-                rgb=gs_rgb[0].reshape(-1, 3)[static_idx],
-                semantic_class=semantic_argmax[0].reshape(-1)[static_idx].unsqueeze(-1).to(torch.uint8),
-                normals=normals[0].reshape(-1, 3)[static_idx],
+                positions=positions[static_indices],
+                rotations=rotations[static_indices],
+                scales=scales[static_indices],
+                densities=densities[static_indices],
+                rgb=rgb[static_indices],
+                semantic_class=semantic_class[static_indices].unsqueeze(-1).to(torch.uint8),
+                normals=normals[static_indices],
             )
+            if dynamic_indices.numel() == 0:
+                dynamic_layer = self._empty_dynamic_layer(static_layer.positions.device)
+            else:
+                dynamic_layer = KelvinDynamicLayer(
+                    max_densities=densities[dynamic_indices],
+                    keyframe_positions=torch.stack(
+                        [
+                            previous_positions[dynamic_indices],
+                            positions[dynamic_indices],
+                            next_positions[dynamic_indices],
+                        ],
+                        dim=1,
+                    ),
+                    keyframe_timestamps_us=torch.stack(
+                        [
+                            prev_target_timestamps_us[dynamic_indices],
+                            source_timestamps_us[dynamic_indices],
+                            next_target_timestamps_us[dynamic_indices],
+                        ],
+                        dim=1,
+                    ),
+                    rotations=rotations[dynamic_indices],
+                    scales=scales[dynamic_indices],
+                    rgb=rgb[dynamic_indices],
+                ).ensure_minimum_density(0.75)
 
             primitives.append(
                 KelvinInstantNuRecPrimitive(
                     static_layer=static_layer,
-                    dynamic_layers=[self._empty_dynamic_layer(static_layer.positions.device)],
-                    sky_cubemap=self._placeholder_sky_cubemap(
-                        static_layer.positions.device, static_layer.positions.dtype
-                    ),
-                    affine_matrix=affine[0],  # (1, n_cams, 3, 4) -> (n_cams, 3, 4)
+                    dynamic_layers=[dynamic_layer],
+                    sky_cubemap=output.sky_cubemap[0],
+                    sky_cubemap_mask=output.sky_cubemap_mask[0],
+                    affine_matrix=output.affine_matrix[0],
                 )
             )
         return primitives

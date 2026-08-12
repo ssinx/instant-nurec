@@ -75,3 +75,19 @@ class PredictConfig(BaseConfigSchema):
         default_factory=InputCameraRenderConfig,
         description="Diagnostic rendering from the source camera viewpoints",
     )
+    render_preview: bool = Field(
+        default=False,
+        description=(
+            "Render the first context camera frame for each exported chunk with its calibrated "
+            "NCore F-theta geometry, "
+            "including the observation-derived sky cubemap. Requires the render extra."
+        ),
+    )
+    render_video: bool = Field(
+        default=False,
+        description=(
+            "Render all original frames from the first context camera with its calibrated "
+            "NCore F-theta trajectory, including the observation-derived sky cubemap. Requires "
+            "one complete merged sequence, the render extra, and ffmpeg."
+        ),
+    )

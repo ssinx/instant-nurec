@@ -33,11 +33,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 
-from instant_nurec.model.inference import (  # noqa: E402
-    _PLACEHOLDER_SKY_CUBEMAP_SIZE,
-    KelvinInferenceModel,
+from instant_nurec.model.inference import KelvinInferenceModel  # noqa: E402
+from instant_nurec.model.static_core import (  # noqa: E402
+    KelvinDenseStaticOutput,
+    KelvinPointQueryStaticOutput,
 )
-from instant_nurec.model.static_core import KelvinPointQueryStaticOutput  # noqa: E402
 from instant_nurec.primitives.kelvin_primitive import (  # noqa: E402
     KelvinDynamicLayer,
     KelvinSemanticClass,
@@ -58,8 +58,33 @@ class _FakeStaticCore(torch.nn.Module):
         self._dynamic_pixel_idx = dynamic_pixel_idx
         self.calls: list[tuple] = []
 
-    def forward(self, rgb, c2w, fov, rays, distance_to_depth_scale, camera_idxs):
-        self.calls.append((rgb, c2w, fov, rays, distance_to_depth_scale, camera_idxs))
+    def forward(
+        self,
+        rgb,
+        c2w,
+        fov,
+        rays,
+        distance_to_depth_scale,
+        camera_idxs,
+        source_timestamps_us,
+        prev_target_timestamps_us,
+        next_target_timestamps_us,
+        time_remappings,
+    ):
+        self.calls.append(
+            (
+                rgb,
+                c2w,
+                fov,
+                rays,
+                distance_to_depth_scale,
+                camera_idxs,
+                source_timestamps_us,
+                prev_target_timestamps_us,
+                next_target_timestamps_us,
+                time_remappings,
+            )
+        )
         B, V, H, W = self.B, self.V, self.H, self.W
         n_pixels = V * H * W
 
@@ -79,26 +104,50 @@ class _FakeStaticCore(torch.nn.Module):
         normals = torch.full((B, V, H, W, 3), 0.1)
         affine = torch.zeros(B, self.n_cams, 3, 4)
         affine[..., :3] = torch.eye(3)
-        return gs_xyz, gs_rotations, gs_scales, gs_densities, gs_rgb, semantic, normals, affine
+        sky_cubemap = torch.full((B, 6, 8, 8, 3), 0.25)
+        sky_cubemap_mask = torch.ones(B, 6, 8, 8, 1)
+        return KelvinDenseStaticOutput(
+            positions=gs_xyz,
+            rotations=gs_rotations,
+            scales=gs_scales,
+            densities=gs_densities,
+            rgb=gs_rgb,
+            semantic_class=semantic,
+            normals=normals,
+            affine_matrix=affine,
+            prev_flow=torch.zeros_like(gs_xyz),
+            next_flow=torch.zeros_like(gs_xyz),
+            source_timestamps_us=source_timestamps_us,
+            prev_target_timestamps_us=prev_target_timestamps_us,
+            next_target_timestamps_us=next_target_timestamps_us,
+            sky_cubemap=sky_cubemap,
+            sky_cubemap_mask=sky_cubemap_mask,
+        )
 
 
 class _FakePointQueryStaticCore(_FakeStaticCore):
     """Sparse-output counterpart used to cover point-query packaging."""
 
-    def forward(self, rgb, c2w, fov, rays, distance_to_depth_scale, camera_idxs):
-        dense = super().forward(rgb, c2w, fov, rays, distance_to_depth_scale, camera_idxs)
-        xyz, rotations, scales, densities, color, semantic, normals, affine = dense
+    def forward(self, *args):
+        dense = super().forward(*args)
         source_indices = torch.tensor([[0, 5, 9]], dtype=torch.int64)
         return KelvinPointQueryStaticOutput(
-            positions=xyz.reshape(self.B, -1, 3)[:, source_indices[0]],
-            rotations=rotations.reshape(self.B, -1, 4)[:, source_indices[0]],
-            scales=scales.reshape(self.B, -1, 3)[:, source_indices[0]],
-            densities=densities.reshape(self.B, -1, 1)[:, source_indices[0]],
-            rgb=color.reshape(self.B, -1, 3)[:, source_indices[0]],
-            semantic_class=semantic.reshape(self.B, -1)[:, source_indices[0]],
-            normals=normals.reshape(self.B, -1, 3)[:, source_indices[0]],
-            affine_matrix=affine,
+            positions=dense.positions.reshape(self.B, -1, 3)[:, source_indices[0]],
+            rotations=dense.rotations.reshape(self.B, -1, 4)[:, source_indices[0]],
+            scales=dense.scales.reshape(self.B, -1, 3)[:, source_indices[0]],
+            densities=dense.densities.reshape(self.B, -1, 1)[:, source_indices[0]],
+            rgb=dense.rgb.reshape(self.B, -1, 3)[:, source_indices[0]],
+            semantic_class=dense.semantic_class.reshape(self.B, -1)[:, source_indices[0]],
+            normals=dense.normals.reshape(self.B, -1, 3)[:, source_indices[0]],
+            affine_matrix=dense.affine_matrix,
             source_indices=source_indices,
+            prev_flow=dense.prev_flow,
+            next_flow=dense.next_flow,
+            source_timestamps_us=dense.source_timestamps_us,
+            prev_target_timestamps_us=dense.prev_target_timestamps_us,
+            next_target_timestamps_us=dense.next_target_timestamps_us,
+            sky_cubemap=dense.sky_cubemap,
+            sky_cubemap_mask=dense.sky_cubemap_mask,
         )
 
 
@@ -198,18 +247,22 @@ def test_reconstruct_no_cuboid_tracks_returns_one_primitive_per_batch():
     assert len(primitive.dynamic_layers[0]) == 0  # placeholder is empty
 
 
-def test_reconstruct_drops_movable_pixels_in_semantic_only_mode():
+def test_reconstruct_assigns_movable_pixels_to_dynamic_layer_with_minimum_density():
     V, H, W = 2, 4, 4
-    # Mark one pixel as MOVABLE -- semantic-only branch should drop it.
+    # Mark one pixel as MOVABLE -- semantic-only branch should create one
+    # dynamic Gaussian with the decoder's official minimum density.
     core = _FakeStaticCore(B=1, V=V, H=H, W=W, n_cams=1, dynamic_pixel_idx=5)
     adapter = _make_adapter(core)
 
     out = adapter.reconstruct([_fake_batch(V, H, W)], cuboid_tracks=None)
 
     assert len(out[0].static_layer) == V * H * W - 1
+    dynamic_layer = out[0].dynamic_layers[0]
+    assert len(dynamic_layer) == 1
+    torch.testing.assert_close(dynamic_layer.max_densities, torch.tensor([[0.75]]))
 
 
-def test_reconstruct_with_tracks_keeps_unassociated_movable_gaussians(monkeypatch):
+def test_reconstruct_with_tracks_overrides_dynamic_association_and_motion(monkeypatch):
     from types import SimpleNamespace
 
     from instant_nurec.model import inference as inference_mod
@@ -217,11 +270,13 @@ def test_reconstruct_with_tracks_keeps_unassociated_movable_gaussians(monkeypatc
 
     class _AllMovableStaticCore(_FakeStaticCore):
         def forward(self, *args):
-            output = list(super().forward(*args))
-            output[5].fill_(KelvinSemanticClass.MOVABLE.value)
-            return tuple(output)
+            output = super().forward(*args)
+            output.semantic_class.fill_(KelvinSemanticClass.MOVABLE.value)
+            return output
 
     class _DynamicTrack:
+        n_tracks = 1
+
         def ray_intersection(self, origins, directions, timestamps, **kwargs):
             del origins, directions, timestamps, kwargs
             return SimpleNamespace(
@@ -236,10 +291,11 @@ def test_reconstruct_with_tracks_keeps_unassociated_movable_gaussians(monkeypatc
     )
 
     def _fake_warp(**kwargs):
-        # The first MOVABLE Gaussian is associated with a dynamic track; the
-        # second is parked/unassociated and must remain in the static export.
+        # The first MOVABLE Gaussian is track-associated. The second is
+        # unassociated and remains in the static export.
         assert torch.equal(kwargs["aux_tracks_idx"].reshape(-1), torch.tensor([0, -1]))
-        return kwargs["aux_tracks_idx"] >= 0, []
+        points = kwargs["points"]
+        return kwargs["aux_tracks_idx"] >= 0, [points + 10.0, points + 20.0]
 
     monkeypatch.setattr(inference_mod, "warp_points_with_cuboid_tracks", _fake_warp)
 
@@ -252,6 +308,40 @@ def test_reconstruct_with_tracks_keeps_unassociated_movable_gaussians(monkeypatc
     assert len(primitive.static_layer) == 1
     assert torch.equal(primitive.static_layer.positions, torch.tensor([[3.0, 4.0, 5.0]]))
     assert primitive.static_layer.semantic_class.item() == KelvinSemanticClass.MOVABLE.value
+    dynamic_layer = primitive.dynamic_layers[0]
+    assert len(dynamic_layer) == 1
+    torch.testing.assert_close(dynamic_layer.keyframe_positions[0, 0], torch.tensor([10.0, 11.0, 12.0]))
+
+
+def test_empty_dynamic_tracks_fall_back_to_learned_motion(monkeypatch):
+    from types import SimpleNamespace
+
+    from instant_nurec.model import inference as inference_mod
+
+    adapter = _make_adapter(_FakeStaticCore(B=1, V=1, H=1, W=1, n_cams=1))
+    monkeypatch.setattr(
+        inference_mod.CuboidTracks.Ops,
+        "subset_from_mask",
+        lambda tracks, mask: SimpleNamespace(n_tracks=0),
+    )
+    positions = torch.zeros(1, 3)
+    previous = torch.full((1, 3), -1.0)
+    following = torch.full((1, 3), 1.0)
+    mask, actual_previous, actual_following = adapter._refine_dynamic_motion(
+        positions=positions,
+        semantic_class=torch.tensor([KelvinSemanticClass.MOVABLE.value]),
+        predicted_prev_positions=previous,
+        predicted_next_positions=following,
+        rays=torch.zeros(1, 6),
+        source_timestamps_us=torch.zeros(1, dtype=torch.int64),
+        prev_target_timestamps_us=torch.full((1,), -1, dtype=torch.int64),
+        next_target_timestamps_us=torch.ones(1, dtype=torch.int64),
+        cuboid_tracks=SimpleNamespace(tracks_flags=torch.empty(0, dtype=torch.int64)),
+    )
+
+    assert mask.item()
+    torch.testing.assert_close(actual_previous, previous)
+    torch.testing.assert_close(actual_following, following)
 
 
 def test_reconstruct_packages_sparse_point_query_output():
@@ -268,20 +358,18 @@ def test_reconstruct_packages_sparse_point_query_output():
     )
 
 
-def test_sparse_dynamic_mask_gathers_aligned_source_rays_and_timestamps(monkeypatch):
+def test_cuboid_calibration_uses_aligned_rays_and_timestamps(monkeypatch):
     from types import SimpleNamespace
 
     from instant_nurec.model import inference as inference_mod
     from instant_nurec.utils.types import TrackFlags
 
-    adapter = _make_adapter(_FakePointQueryStaticCore(B=1, V=1, H=2, W=3, n_cams=1))
-    rendering = _fake_batch(V=1, H=2, W=3).rendering.camera
-    rendering.rays = torch.arange(6 * 6, dtype=torch.float32).reshape(1, 2, 3, 6)
-    rendering.rays_timestamps_us = torch.arange(6, dtype=torch.int64).reshape(1, 2, 3, 1)
-    source_indices = torch.tensor([[4, 1]], dtype=torch.int64)
+    adapter = _make_adapter(_FakePointQueryStaticCore(B=1, V=1, H=1, W=2, n_cams=1))
     captured = {}
 
     class _DynamicTrack:
+        n_tracks = 1
+
         def ray_intersection(self, origins, directions, timestamps, **kwargs):
             captured["origins"] = origins
             captured["directions"] = directions
@@ -301,38 +389,47 @@ def test_sparse_dynamic_mask_gathers_aligned_source_rays_and_timestamps(monkeypa
     def _fake_warp(**kwargs):
         captured["points"] = kwargs["points"]
         captured["source_timestamps"] = kwargs["source_timestamps_us"]
-        return torch.tensor([True, False]), []
+        return torch.tensor([True, False]), [kwargs["points"] + 1.0, kwargs["points"] + 2.0]
 
     monkeypatch.setattr(inference_mod, "warp_points_with_cuboid_tracks", _fake_warp)
-    xyz = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)
-    semantic = torch.full((1, 2), KelvinSemanticClass.MOVABLE.value, dtype=torch.int64)
+    xyz = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    semantic = torch.full((2,), KelvinSemanticClass.MOVABLE.value, dtype=torch.int64)
+    rays = torch.arange(12, dtype=torch.float32).reshape(2, 6)
+    source_timestamps = torch.tensor([4, 1], dtype=torch.int64)
     tracks = SimpleNamespace(tracks_flags=torch.tensor([int(TrackFlags.DYNAMIC)]))
 
-    dynamic_mask = adapter._compute_dynamic_mask(
-        xyz,
-        semantic,
-        rendering,
-        tracks,
-        source_indices,
+    dynamic_mask, previous_positions, next_positions = adapter._refine_dynamic_motion(
+        positions=xyz,
+        semantic_class=semantic,
+        predicted_prev_positions=xyz,
+        predicted_next_positions=xyz,
+        rays=rays,
+        source_timestamps_us=source_timestamps,
+        prev_target_timestamps_us=source_timestamps - 1,
+        next_target_timestamps_us=source_timestamps + 1,
+        cuboid_tracks=tracks,
     )
 
-    flat_rays = rendering.rays.reshape(-1, 6)[source_indices[0]]
-    assert torch.equal(captured["origins"], flat_rays[:, :3])
-    assert torch.equal(captured["directions"], flat_rays[:, 3:])
+    assert torch.equal(captured["origins"], rays[:, :3])
+    assert torch.equal(captured["directions"], rays[:, 3:])
     assert torch.equal(captured["ray_timestamps"], torch.tensor([4, 1]))
-    assert torch.equal(captured["source_timestamps"], torch.tensor([[4], [1]]))
+    assert torch.equal(captured["source_timestamps"], source_timestamps)
     assert torch.equal(dynamic_mask, torch.tensor([True, False]))
+    torch.testing.assert_close(previous_positions[0], xyz[0] + 1.0)
+    torch.testing.assert_close(previous_positions[1], xyz[1] + 1.0)
+    torch.testing.assert_close(next_positions[0], xyz[0] + 2.0)
+    torch.testing.assert_close(next_positions[1], xyz[1] + 2.0)
 
 
-def test_reconstruct_uses_placeholder_sky_cubemap_shape():
+def test_reconstruct_preserves_observation_derived_sky_cubemap():
     V, H, W = 2, 4, 4
     core = _FakeStaticCore(B=1, V=V, H=H, W=W, n_cams=1)
     adapter = _make_adapter(core)
     out = adapter.reconstruct([_fake_batch(V, H, W)], cuboid_tracks=None)
     sky = out[0].sky_cubemap
-    s = _PLACEHOLDER_SKY_CUBEMAP_SIZE
-    assert sky.shape == (6, s, s, 3)
-    assert torch.all(sky == 0)
+    assert sky.shape == (6, 8, 8, 3)
+    assert torch.all(sky == 0.25)
+    assert torch.all(out[0].sky_cubemap_mask == 1)
 
 
 def test_reconstruct_affine_matrix_shape_squeezed_to_per_camera():
@@ -349,7 +446,18 @@ def test_reconstruct_passes_extracted_tensors_to_static_core():
     adapter = _make_adapter(core)
     adapter.reconstruct([_fake_batch(V, H, W)], cuboid_tracks=None)
 
-    rgb, c2w, fov, rays, distance_to_depth_scale, camera_idxs = core.calls[0]
+    (
+        rgb,
+        c2w,
+        fov,
+        rays,
+        distance_to_depth_scale,
+        camera_idxs,
+        source_timestamps_us,
+        prev_target_timestamps_us,
+        next_target_timestamps_us,
+        time_remappings,
+    ) = core.calls[0]
     # Every input is shape ``(1, V, ...)`` with the leading B=1 dim added by
     # the adapter's per-batch unsqueeze.
     assert rgb.shape == (1, V, H, W, 3)
@@ -358,6 +466,10 @@ def test_reconstruct_passes_extracted_tensors_to_static_core():
     assert rays.shape == (1, V, H, W, 6)
     assert distance_to_depth_scale.shape == (1, V, H, W, 1)
     assert camera_idxs.shape == (1, V)
+    assert source_timestamps_us.shape == (1, V, H, W, 1)
+    assert prev_target_timestamps_us.shape == (1, V, H, W, 1)
+    assert next_target_timestamps_us.shape == (1, V, H, W, 1)
+    assert len(time_remappings) == 1
 
 
 def test_reconstruct_static_layer_semantic_class_is_uint8():
@@ -386,7 +498,7 @@ def test_prepare_context_passthrough():
     assert adapter.prepare_context(context) is context
 
 
-# ---------- _empty_dynamic_layer / _placeholder_sky_cubemap ----------
+# ---------- _empty_dynamic_layer ----------
 
 
 def test_empty_dynamic_layer_has_zero_gaussians_with_correct_dtypes():
@@ -395,14 +507,6 @@ def test_empty_dynamic_layer_has_zero_gaussians_with_correct_dtypes():
     assert len(layer) == 0
     assert layer.keyframe_timestamps_us.dtype == torch.int64
     assert layer.rotations.dtype == torch.float32
-
-
-def test_placeholder_sky_cubemap_dtype_and_shape():
-    adapter = _make_adapter(_FakeStaticCore(1, 1, 1, 1, 1))
-    cube = adapter._placeholder_sky_cubemap(torch.device("cpu"), torch.float64)
-    assert cube.shape == (6, _PLACEHOLDER_SKY_CUBEMAP_SIZE, _PLACEHOLDER_SKY_CUBEMAP_SIZE, 3)
-    assert cube.dtype == torch.float64
-    assert torch.all(cube == 0)
 
 
 def test_pytest_collected(monkeypatch):

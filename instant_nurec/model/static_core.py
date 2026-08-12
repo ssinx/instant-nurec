@@ -37,6 +37,8 @@ from instant_nurec.model.backbone.decoders import KelvinDPTDecoder, KelvinPointQ
 from instant_nurec.model.backbone.encoders import KelvinDAv3Encoder
 from instant_nurec.model.post_processing import PerCameraAffinePostProcessing
 from instant_nurec.config_schema.models import KelvinModelConfig, KelvinPointQueryCADecoderConfig
+from instant_nurec.utils.cubemap import build_observed_sky_cubemap_with_mask
+from instant_nurec.utils.motion import TimeRemapping
 
 
 @dataclass(kw_only=True, slots=True)
@@ -58,14 +60,43 @@ class KelvinPointQueryStaticOutput:
     normals: torch.Tensor
     affine_matrix: torch.Tensor
     source_indices: torch.Tensor
+    prev_flow: torch.Tensor
+    next_flow: torch.Tensor
+    source_timestamps_us: torch.Tensor
+    prev_target_timestamps_us: torch.Tensor
+    next_target_timestamps_us: torch.Tensor
+    sky_cubemap: torch.Tensor
+    sky_cubemap_mask: torch.Tensor
+
+
+@dataclass(kw_only=True, slots=True)
+class KelvinDenseStaticOutput:
+    """Dense Gaussian fields, predicted motion, and aligned pixel timestamps."""
+
+    positions: torch.Tensor
+    rotations: torch.Tensor
+    scales: torch.Tensor
+    densities: torch.Tensor
+    rgb: torch.Tensor
+    semantic_class: torch.Tensor
+    normals: torch.Tensor
+    affine_matrix: torch.Tensor
+    prev_flow: torch.Tensor
+    next_flow: torch.Tensor
+    source_timestamps_us: torch.Tensor
+    prev_target_timestamps_us: torch.Tensor
+    next_target_timestamps_us: torch.Tensor
+    sky_cubemap: torch.Tensor
+    sky_cubemap_mask: torch.Tensor
 
 
 class KelvinStaticCore(nn.Module):
     """Static Gaussian reconstruction heads used by public inference."""
 
-    # Class indices for KelvinSemanticClass.{EGO,SKY,MOVABLE}.
+    # Class indices for KelvinSemanticClass.{EGO,SKY,ROAD,MOVABLE}.
     _SEMANTIC_EGO: int = 1
     _SEMANTIC_SKY: int = 2
+    _SEMANTIC_ROAD: int = 3
     _SEMANTIC_MOVABLE: int = 4
 
     def __init__(self, config: KelvinModelConfig) -> None:
@@ -83,6 +114,7 @@ class KelvinStaticCore(nn.Module):
             init_token_scale=0.02,
         )
         self.scene_rescale = inference_config.scene_rescale
+        self.sky_cubemap_size = inference_config.sky.cubemap_size
 
     @torch.autocast("cuda", enabled=False)
     def forward(
@@ -93,19 +125,11 @@ class KelvinStaticCore(nn.Module):
         rays: torch.Tensor,
         distance_to_depth_scale: torch.Tensor,
         camera_idxs: torch.Tensor,
-    ) -> (
-        tuple[
-            torch.Tensor,  # gs_xyz             (B, V, H, W, 3)
-            torch.Tensor,  # gs_rotations       (B, V, H, W, 4)
-            torch.Tensor,  # gs_scales          (B, V, H, W, 3)
-            torch.Tensor,  # gs_densities       (B, V, H, W, 1)
-            torch.Tensor,  # gs_rgb             (B, V, H, W, 3)
-            torch.Tensor,  # semantic_argmax    (B, V, H, W)   int64
-            torch.Tensor,  # normals            (B, V, H, W, 3)
-            torch.Tensor,  # affine             (B, n_affine_tokens, 3, 4)
-        ]
-        | KelvinPointQueryStaticOutput
-    ):
+        source_timestamps_us: torch.Tensor,
+        prev_target_timestamps_us: torch.Tensor,
+        next_target_timestamps_us: torch.Tensor,
+        time_remappings: list[TimeRemapping],
+    ) -> KelvinDenseStaticOutput | KelvinPointQueryStaticOutput:
         """Run the static model heads on pre-extracted tensors.
 
         Inputs (B=1):
@@ -116,11 +140,9 @@ class KelvinStaticCore(nn.Module):
             distance_to_depth_scale: (1, V, H, W, 1)
             camera_idxs:             (1, V) int64
 
-        Returns the *unmasked* Gaussian fields plus the affine matrix. The
-        DPT decoder returns the dense tuple layout; the point-query
-        decoder returns :class:`KelvinPointQueryStaticOutput`. Static/dynamic
-        split and cuboid-track-based mask refinement happen in
-        ``KelvinInferenceModel``.
+        Returns the *unmasked* Gaussian fields, predicted motion, and affine
+        matrix. Static/dynamic split and cuboid-track-based motion refinement
+        happen in ``KelvinInferenceModel``.
         """
         scene_rescale = self.scene_rescale
         is_point_query = isinstance(self.decoder, KelvinPointQueryCADecoder)
@@ -135,7 +157,7 @@ class KelvinStaticCore(nn.Module):
         # retains its FP16 path.
         encoder_dtype = torch.bfloat16 if is_point_query else torch.float16
         with torch.autocast("cuda", enabled=True, dtype=encoder_dtype):
-            img_feats, _ = self.encoder.vit.get_intermediate_features(
+            img_feats, cls_tokens = self.encoder.vit.get_intermediate_features(
                 x,
                 block_indices=self.encoder.take_block_indices,
                 global_cls_token=camera_encodings.unsqueeze(2),
@@ -169,6 +191,33 @@ class KelvinStaticCore(nn.Module):
         )
         context_rgb = self.decoder.gaussian_activations.rgb(context_rgb)
         context_world_normal = torch.nn.functional.normalize(context_world_normal, dim=-1)
+        semantic_argmax = torch.argmax(context_semantic_logits, dim=-1)
+
+        observed_sky = [
+            build_observed_sky_cubemap_with_mask(
+                self.sky_cubemap_size,
+                rays[batch_index, ..., 3:],
+                context_rgb[batch_index],
+                semantic_argmax[batch_index] == self._SEMANTIC_SKY,
+                semantic_argmax[batch_index] == self._SEMANTIC_ROAD,
+            )
+            for batch_index in range(B)
+        ]
+        sky_cubemap = torch.stack([item[0] for item in observed_sky], dim=0)
+        sky_cubemap_mask = torch.stack([item[1] for item in observed_sky], dim=0)
+
+        context_prev_flow, context_next_flow = self.decoder.context_motion_head.forward(
+            KelvinMultiscaleFeaturesLatent(features=img_feats, cls_tokens=cls_tokens),
+            output_shape=(H, W),
+            fusion_features=None,
+            chunk_size=chunk_size,
+            time_remappings=time_remappings,
+            source_timestamps_us=source_timestamps_us,
+            prev_target_timestamps_us=prev_target_timestamps_us,
+            next_target_timestamps_us=next_target_timestamps_us,
+        )
+        context_prev_flow = context_prev_flow / scene_rescale
+        context_next_flow = context_next_flow / scene_rescale
 
         # Point-query replaces the dense Gaussian head with sparse queries.
         point_query_output = None
@@ -200,7 +249,6 @@ class KelvinStaticCore(nn.Module):
             gs_opacity = self.decoder.gaussian_activations.opacity(gs_opacity) * (gs_valid_mask > 0.5).float().detach()
             gs_world_quaternion = self.decoder.gaussian_activations.rotation(gs_world_quaternion)
             gs_xyz = rays[..., :3] + rays[..., 3:] * gs_distance  # (B, V, H, W, 3)
-            semantic_argmax = torch.argmax(context_semantic_logits, dim=-1)  # (B, V, H, W)
 
         # ----- Per-camera affine post-processing -----
         encoded_deepest_tokens = rearrange(encoded_deepest, "B V h w C -> B (V h w) C")
@@ -222,15 +270,29 @@ class KelvinStaticCore(nn.Module):
                 normals=point_query_output.normals,
                 affine_matrix=affine_matrix,
                 source_indices=point_query_output.source_indices,
+                prev_flow=context_prev_flow,
+                next_flow=context_next_flow,
+                source_timestamps_us=source_timestamps_us,
+                prev_target_timestamps_us=prev_target_timestamps_us,
+                next_target_timestamps_us=next_target_timestamps_us,
+                sky_cubemap=sky_cubemap,
+                sky_cubemap_mask=sky_cubemap_mask,
             )
 
-        return (
-            gs_xyz,
-            gs_world_quaternion,
-            gs_scale,
-            gs_opacity,
-            context_rgb,
-            semantic_argmax,
-            context_world_normal,
-            affine_matrix,
+        return KelvinDenseStaticOutput(
+            positions=gs_xyz,
+            rotations=gs_world_quaternion,
+            scales=gs_scale,
+            densities=gs_opacity,
+            rgb=context_rgb,
+            semantic_class=semantic_argmax,
+            normals=context_world_normal,
+            affine_matrix=affine_matrix,
+            prev_flow=context_prev_flow,
+            next_flow=context_next_flow,
+            source_timestamps_us=source_timestamps_us,
+            prev_target_timestamps_us=prev_target_timestamps_us,
+            next_target_timestamps_us=next_target_timestamps_us,
+            sky_cubemap=sky_cubemap,
+            sky_cubemap_mask=sky_cubemap_mask,
         )
