@@ -230,6 +230,7 @@ def test_make_builds_source_core_and_loads_weights(monkeypatch, tmp_path):
         release_profile="pa-front",
         model=model_config,
         dataset=SimpleNamespace(predict=dataset_config),
+        predict=SimpleNamespace(use_cuboid_motion_calibration=True),
     )
 
     monkeypatch.setattr(
@@ -261,6 +262,7 @@ def test_make_builds_source_core_and_loads_weights(monkeypatch, tmp_path):
     assert calls["strict"] is True
     assert calls["inference_kwargs"] == {
         "scene_rescale": 0.15,
+        "use_cuboid_motion_calibration": True,
         "expected_frames": 18,
         "expected_height": 448,
         "expected_width": 784,

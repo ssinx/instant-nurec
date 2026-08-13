@@ -151,7 +151,12 @@ class _FakePointQueryStaticCore(_FakeStaticCore):
         )
 
 
-def _make_adapter(static_core: _FakeStaticCore, scene_rescale: float = 0.5) -> KelvinInferenceModel:
+def _make_adapter(
+    static_core: _FakeStaticCore,
+    scene_rescale: float = 0.5,
+    *,
+    use_cuboid_motion_calibration: bool = True,
+) -> KelvinInferenceModel:
     """Build the inference wrapper around the small fake source core."""
     from types import SimpleNamespace
 
@@ -161,6 +166,7 @@ def _make_adapter(static_core: _FakeStaticCore, scene_rescale: float = 0.5) -> K
     return KelvinInferenceModel(
         static_core=static_core,
         scene_rescale=scene_rescale,
+        use_cuboid_motion_calibration=use_cuboid_motion_calibration,
         expected_frames=static_core.V,
         expected_height=static_core.H,
         expected_width=static_core.W,
@@ -342,6 +348,39 @@ def test_empty_dynamic_tracks_fall_back_to_learned_motion(monkeypatch):
     assert mask.item()
     torch.testing.assert_close(actual_previous, previous)
     torch.testing.assert_close(actual_following, following)
+
+
+def test_learned_motion_only_does_not_apply_available_cuboid_tracks(monkeypatch):
+    from types import SimpleNamespace
+
+    from instant_nurec.model import inference as inference_mod
+    from instant_nurec.utils.types import TrackFlags
+
+    class _AllMovableStaticCore(_FakeStaticCore):
+        def forward(self, *args):
+            output = super().forward(*args)
+            output.semantic_class.fill_(KelvinSemanticClass.MOVABLE.value)
+            output.prev_flow.fill_(-2.0)
+            output.next_flow.fill_(3.0)
+            return output
+
+    adapter = _make_adapter(
+        _AllMovableStaticCore(B=1, V=1, H=1, W=1, n_cams=1),
+        use_cuboid_motion_calibration=False,
+    )
+    monkeypatch.setattr(
+        inference_mod,
+        "warp_points_with_cuboid_tracks",
+        lambda **kwargs: pytest.fail("cuboid calibration must not run in learned-motion-only mode"),
+    )
+    tracks = SimpleNamespace(tracks_flags=torch.tensor([int(TrackFlags.DYNAMIC)]))
+
+    primitive = adapter.reconstruct([_fake_batch(V=1, H=1, W=1)], [tracks])[0]
+
+    dynamic = primitive.dynamic_layers[0]
+    assert len(dynamic) == 1
+    torch.testing.assert_close(dynamic.keyframe_positions[:, 0], dynamic.keyframe_positions[:, 1] - 2.0)
+    torch.testing.assert_close(dynamic.keyframe_positions[:, 2], dynamic.keyframe_positions[:, 1] + 3.0)
 
 
 def test_reconstruct_packages_sparse_point_query_output():

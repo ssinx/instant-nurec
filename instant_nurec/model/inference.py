@@ -39,6 +39,7 @@ class KelvinInferenceModel(nn.Module):
         static_core: KelvinStaticCore,
         *,
         scene_rescale: float,
+        use_cuboid_motion_calibration: bool = True,
         expected_frames: int,
         expected_height: int,
         expected_width: int,
@@ -46,6 +47,7 @@ class KelvinInferenceModel(nn.Module):
         super().__init__()
         self.static_core = static_core
         self.scene_rescale = scene_rescale
+        self.use_cuboid_motion_calibration = use_cuboid_motion_calibration
         self.expected_b = 1
         self.expected_v = expected_frames
         self.expected_h = expected_height
@@ -145,6 +147,60 @@ class KelvinInferenceModel(nn.Module):
             rgb=torch.zeros(0, 3, device=device),
         )
 
+    @staticmethod
+    def _log_displacement_stats(
+        *,
+        chunk_index: int,
+        label: str,
+        positions: torch.Tensor,
+        previous_positions: torch.Tensor,
+        next_positions: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
+        """Log enough displacement statistics to distinguish a silent motion head from masking."""
+        count = int(mask.sum().item())
+        if count == 0:
+            logger.warning("Motion diagnostics for chunk %d (%s): no selected Gaussians.", chunk_index, label)
+            return
+
+        previous_norm = torch.linalg.vector_norm(previous_positions[mask] - positions[mask], dim=-1).float()
+        next_norm = torch.linalg.vector_norm(next_positions[mask] - positions[mask], dim=-1).float()
+
+        def summarize(values: torch.Tensor) -> tuple[int, float, float, float, float]:
+            finite_values = values[torch.isfinite(values)]
+            if finite_values.numel() == 0:
+                return 0, math.nan, math.nan, math.nan, math.nan
+            return (
+                int(finite_values.numel()),
+                float(finite_values.min().item()),
+                float(finite_values.median().item()),
+                float(finite_values.mean().item()),
+                float(finite_values.max().item()),
+            )
+
+        prev_finite, prev_min, prev_median, prev_mean, prev_max = summarize(previous_norm)
+        next_finite, next_min, next_median, next_mean, next_max = summarize(next_norm)
+        logger.info(
+            "Motion diagnostics for chunk %d (%s, n=%d, meters): "
+            "previous[finite=%d/%d min=%.6g median=%.6g mean=%.6g max=%.6g], "
+            "next[finite=%d/%d min=%.6g median=%.6g mean=%.6g max=%.6g].",
+            chunk_index,
+            label,
+            count,
+            prev_finite,
+            count,
+            prev_min,
+            prev_median,
+            prev_mean,
+            prev_max,
+            next_finite,
+            count,
+            next_min,
+            next_median,
+            next_mean,
+            next_max,
+        )
+
     def _refine_dynamic_motion(
         self,
         *,
@@ -221,17 +277,51 @@ class KelvinInferenceModel(nn.Module):
             ).squeeze(-1)
             rays = self._gather_source_pixels(tensors[3], source_indices)
 
+            learned_dynamic_mask = semantic_class == self._semantic_movable_value()
+            predicted_previous_positions = positions + prev_flow
+            predicted_next_positions = positions + next_flow
+            self._log_displacement_stats(
+                chunk_index=batch_index,
+                label="learned-motion-head/all-queries",
+                positions=positions,
+                previous_positions=predicted_previous_positions,
+                next_positions=predicted_next_positions,
+                mask=torch.ones_like(learned_dynamic_mask),
+            )
+            self._log_displacement_stats(
+                chunk_index=batch_index,
+                label="learned-motion-head/movable",
+                positions=positions,
+                previous_positions=predicted_previous_positions,
+                next_positions=predicted_next_positions,
+                mask=learned_dynamic_mask,
+            )
+
+            chunk_cuboid_tracks = cuboid_tracks[batch_index] if cuboid_tracks is not None else None
+            if not self.use_cuboid_motion_calibration:
+                chunk_cuboid_tracks = None
+                logger.info("Cuboid motion calibration disabled for chunk %d; using learned motion only.", batch_index)
+
             dynamic_mask, previous_positions, next_positions = self._refine_dynamic_motion(
                 positions=positions,
                 semantic_class=semantic_class,
-                predicted_prev_positions=positions + prev_flow,
-                predicted_next_positions=positions + next_flow,
+                predicted_prev_positions=predicted_previous_positions,
+                predicted_next_positions=predicted_next_positions,
                 rays=rays,
                 source_timestamps_us=source_timestamps_us,
                 prev_target_timestamps_us=prev_target_timestamps_us,
                 next_target_timestamps_us=next_target_timestamps_us,
-                cuboid_tracks=cuboid_tracks[batch_index] if cuboid_tracks is not None else None,
+                cuboid_tracks=chunk_cuboid_tracks,
             )
+            if chunk_cuboid_tracks is not None:
+                self._log_displacement_stats(
+                    chunk_index=batch_index,
+                    label="cuboid-calibrated/final-dynamic",
+                    positions=positions,
+                    previous_positions=previous_positions,
+                    next_positions=next_positions,
+                    mask=dynamic_mask,
+                )
             class_counts = torch.bincount(semantic_class, minlength=len(KelvinSemanticClass))
             logger.info(
                 "Semantic Gaussians in chunk %d: others=%d ego=%d sky=%d road=%d movable=%d; dynamic=%d.",

@@ -348,6 +348,10 @@ Output bundles are written under
 `<stem>_dynamic.ply` at its median source timestamp. The optional
 `<stem>.render.png` appears only with `--render-preview`, and
 `<stem>.render.mp4` appears only with `--merge --render-video`.
+The complete run log is written to `<output-dir>/instant_nurec.log`. It reports
+the learned motion head's displacement statistics before any cuboid-track
+calibration. Pass `--learned-motion-only` to disable that optional calibration
+and inspect the paper's tracker-free semantic-and-motion path in isolation.
 
 ##### Waymo Open Dataset through the official NCore converter
 
@@ -485,6 +489,7 @@ layer together with the sky cubemap and per-camera affine correction.
 | `--camera-id` | profile-dependent | Override a context camera. Repeat once per camera in canonical order. `pa-front` requires 1; `pa-multiview` supports 1, 3, or 5; `pq-front` is fixed to `camera_front_wide_120fov`. |
 | `--max-chunks` | `8` | Maximum number of time-chunks processed per clip. One chunk spans up to 13.5 s, so the default covers 108 s. Longer clips are truncated and a `WARNING` logs the required value. |
 | `--render-input-cameras` | absent (false) | Render every source camera frame with the `gsplat` CUDA 3DGS rasterizer, evaluating dynamic Gaussians at each frame timestamp, and write an input/render comparison under `out_dir/<run_id>/render/`. |
+| `--learned-motion-only` | absent (false) | Disable optional cuboid-track trajectory calibration so the semantic and motion heads alone determine the dynamic layer. |
 | `--render-preview` | absent (false) | Write `<stem>.render.png` for the first context frame of each exported PLY, using the calibrated NCore F-theta projection, exposure trajectory, and sky. Requires `uv sync --extra render`. |
 | `--render-video` | absent (false) | Write `<stem>.render.mp4` from every original frame of the first context camera, using calibrated NCore F-theta rays, rolling-shutter poses, sky, and camera affine. Requires one resolved sequence, `--merge`, enough `--max-chunks` for full coverage, `uv sync --extra render`, and `ffmpeg` with `libx264`. |
 | `--log-level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`. |

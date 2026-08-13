@@ -200,13 +200,46 @@ def make_parser() -> argparse.ArgumentParser:
         default="INFO",
         help="Logging level forwarded to logging.basicConfig.",
     )
+    parser.add_argument(
+        "--learned-motion-only",
+        action="store_true",
+        help=(
+            "Use the semantic and motion heads without optional cuboid-track trajectory calibration. "
+            "Useful for diagnosing the paper's tracker-free learned motion output."
+        ),
+    )
     return parser
+
+
+def _configure_logging(output_dir: Path, log_level: str) -> Path | None:
+    """Configure terminal logging and, when possible, a persistent run log."""
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    log_path = output_dir / "instant_nurec.log"
+    file_error: OSError | None = None
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_path, mode="w", encoding="utf-8"))
+    except OSError as error:
+        file_error = error
+
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+    cli_logger = logging.getLogger(__name__)
+    if file_error is None:
+        cli_logger.info("Writing inference log to %s", log_path.resolve())
+        return log_path
+    cli_logger.warning("Could not create inference log %s: %s", log_path, file_error)
+    return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = make_parser()
     args = parser.parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level.upper()))
+    _configure_logging(args.output_dir, args.log_level)
 
     if args.render_video and not args.merge:
         parser.error("--render-video requires --merge so one complete scene is rendered")
@@ -341,6 +374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             input_camera_render=InputCameraRenderConfig(
                 enabled=args.render_input_cameras,
             ),
+            use_cuboid_motion_calibration=not args.learned_motion_only,
             render_preview=args.render_preview,
             render_video=args.render_video,
         ),

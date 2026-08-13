@@ -75,6 +75,13 @@ class PredictConfig(BaseConfigSchema):
         default_factory=InputCameraRenderConfig,
         description="Diagnostic rendering from the source camera viewpoints",
     )
+    use_cuboid_motion_calibration: bool = Field(
+        default=True,
+        description=(
+            "Whether optional cuboid tracks replace learned motion for track-associated Gaussians. "
+            "Disable this to inspect the paper's tracker-free learned motion path in isolation."
+        ),
+    )
     render_preview: bool = Field(
         default=False,
         description=(

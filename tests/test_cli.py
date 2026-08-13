@@ -135,6 +135,34 @@ def test_parser_default_log_level_is_info() -> None:
     assert args.log_level == "INFO"
 
 
+def test_parser_learned_motion_only_defaults_false() -> None:
+    from instant_nurec.cli import make_parser
+
+    args = make_parser().parse_args(["--ncore-path", "/x", "--output-dir", "/y"])
+    assert args.learned_motion_only is False
+
+
+def test_parser_accepts_learned_motion_only() -> None:
+    from instant_nurec.cli import make_parser
+
+    args = make_parser().parse_args(
+        ["--ncore-path", "/x", "--output-dir", "/y", "--learned-motion-only"]
+    )
+    assert args.learned_motion_only is True
+
+
+def test_configure_logging_writes_to_output_directory(tmp_path: Path) -> None:
+    from instant_nurec.cli import _configure_logging
+
+    log_path = _configure_logging(tmp_path, "INFO")
+    logging.getLogger("motion-test").info("motion diagnostic sentinel")
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    assert log_path == tmp_path / "instant_nurec.log"
+    assert "motion diagnostic sentinel" in log_path.read_text()
+
+
 def test_parser_merge_flag_sets_true() -> None:
     from instant_nurec.cli import make_parser
     args = make_parser().parse_args(
@@ -221,10 +249,32 @@ def test_main_no_merge_constructs_config_with_disabled_merge(
     assert cfg.out_dir == "/o"
     assert cfg.dataset.predict.ncore_json_paths == [str(json_path.resolve())]
     assert cfg.predict.primitive_merge.enabled is False
+    assert cfg.predict.use_cuboid_motion_calibration is True
     assert cfg.release_profile == "pa-front"
     assert cfg.dataset.predict.context_camera_ids == ["camera_front_wide_120fov"]
     assert cfg.dataset.predict.camera_subsampler.frame_width == 784
     assert cfg.dataset.predict.camera_subsampler.frame_height == 448
+
+
+def test_main_learned_motion_only_disables_cuboid_calibration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    fake_run_predict = _install_runtime_stubs(monkeypatch)
+    json_path = _make_json_path(tmp_path)
+    from instant_nurec.cli import main
+
+    assert main(
+        [
+            "--ncore-path",
+            str(json_path),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--learned-motion-only",
+        ]
+    ) == 0
+
+    cfg = fake_run_predict.call_args.args[0]
+    assert cfg.predict.use_cuboid_motion_calibration is False
 
 
 def test_main_render_preview_preflights_dependency_and_sets_config(

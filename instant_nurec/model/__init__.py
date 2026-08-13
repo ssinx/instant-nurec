@@ -172,6 +172,7 @@ def make(config: "InstantNuRecConfig") -> GaussiansInstantNuRecSystem:
     model = KelvinInferenceModel(
         static_core,
         scene_rescale=config.model.scene_rescale,
+        use_cuboid_motion_calibration=config.predict.use_cuboid_motion_calibration,
         expected_frames=(
             len(dataset_config.context_camera_ids)
             * dataset_config.frame_batch_sampler.n_frames_per_sample
